@@ -3,13 +3,13 @@ import httpx
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# --- الإعدادات (استبدل القيم بمفاتيحك الجديدة) ---
+# --- الإعدادات (ضع مفاتيحك مباشرة هنا) ---
 TELEGRAM_TOKEN = "8865573357:AAF4FBlKqlB7Ah4Yx7d_dCGINWyRnW000lg"
-GEMINI_API_KEY = "AQ.Ab8RN6LH8yARWWmiDPJosLhjHfeLG8VFIpUq0JW8bDQ9jD4fKQ"
+GEMINI_API_KEY = "AQ.Ab8RN6LiIoUKxzaYfgxeVpIPp_NK8-GG1YnFPvmlVRilB-qmjQ"
 
-# نموذج جيميني والرابط المعدل
-MODEL_NAME = "gemini-1.5-flash"  # استخدام اسم النموذج الموصى به
-API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={GEMINI_API_KEY}"
+# الرابط بدون المفتاح
+MODEL_NAME = "gemini-1.5-flash"  # أو gemini-3.6-flash إن شئت التجربة
+API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent"
 
 # --- البرومبت (عقيدة المنجنيق) ---
 SYSTEM_PROMPT = """
@@ -63,16 +63,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in user_histories:
         user_histories[user_id] = []
 
-    # إضافة رسالة المستخدم للسجل
     user_histories[user_id].append({"role": "user", "parts": [{"text": user_text}]})
 
-    # الاحتفاظ بآخر 10 رسائل فقط
     if len(user_histories[user_id]) > 10:
         user_histories[user_id] = user_histories[user_id][-10:]
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
-    # تجهيز البيانات
     payload = {
         "system_instruction": {
             "parts": [{"text": SYSTEM_PROMPT}]
@@ -84,9 +81,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
     }
 
-    # تم إلغاء ترويسة X-goog-api-key لمنع خطأ 401
     headers = {
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY,
     }
 
     try:
@@ -95,13 +92,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response.raise_for_status()
             data = response.json()
 
-            # استخراج النص من الرد
             bot_reply = data['candidates'][0]['content']['parts'][0]['text']
 
-            # إضافة رد البوت للسجل
             user_histories[user_id].append({"role": "model", "parts": [{"text": bot_reply}]})
 
-            # إرسال الرد (مقسم إذا كان طويلاً)
             if len(bot_reply) > 4000:
                 for i in range(0, len(bot_reply), 4000):
                     await update.message.reply_text(bot_reply[i:i+4000])
