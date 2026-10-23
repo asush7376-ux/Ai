@@ -8,8 +8,8 @@ TELEGRAM_TOKEN = "8865573357:AAF4FBlKqlB7Ah4Yx7d_dCGINWyRnW000lg"
 GEMINI_API_KEY = "AQ.Ab8RN6LiIoUKxzaYfgxeVpIPp_NK8-GG1YnFPvmlVRilB-qmjQ"
 
 # الرابط بدون المفتاح
-MODEL_NAME = "gemini-1.5-flash"  # أو gemini-3.6-flash إن شئت التجربة
-API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent"
+MODEL_NAME = "gemini-flash-latest"  # أو gemini-3.6-flash إن شئت التجربة
+API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent"
 
 # --- البرومبت (عقيدة المنجنيق) ---
 SYSTEM_PROMPT = """
