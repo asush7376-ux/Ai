@@ -3,13 +3,13 @@ import httpx
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# --- الإعدادات ---
+# --- الإعدادات (استبدل القيم بمفاتيحك الجديدة) ---
 TELEGRAM_TOKEN = "8865573357:AAF4FBlKqlB7Ah4Yx7d_dCGINWyRnW000lg"
 GEMINI_API_KEY = "AQ.Ab8RN6LH8yARWWmiDPJosLhjHfeLG8VFIpUq0JW8bDQ9jD4fKQ"
 
-# نموذج جيميني
-MODEL_NAME = "gemini-flash-latest"
-API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent"
+# نموذج جيميني والرابط المعدل
+MODEL_NAME = "gemini-1.5-flash"  # استخدام اسم النموذج الموصى به
+API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={GEMINI_API_KEY}"
 
 # --- البرومبت (عقيدة المنجنيق) ---
 SYSTEM_PROMPT = """
@@ -66,13 +66,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # إضافة رسالة المستخدم للسجل
     user_histories[user_id].append({"role": "user", "parts": [{"text": user_text}]})
 
-    # الاحتفاظ بآخر 10 رسائل فقط لمنع تجاوز الحد
+    # الاحتفاظ بآخر 10 رسائل فقط
     if len(user_histories[user_id]) > 10:
         user_histories[user_id] = user_histories[user_id][-10:]
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
-    # تجهيز البيانات بنفس صيغة الـ curl
+    # تجهيز البيانات
     payload = {
         "system_instruction": {
             "parts": [{"text": SYSTEM_PROMPT}]
@@ -84,9 +84,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
     }
 
+    # تم إلغاء ترويسة X-goog-api-key لمنع خطأ 401
     headers = {
-        "Content-Type": "application/json",
-        "X-goog-api-key": GEMINI_API_KEY
+        "Content-Type": "application/json"
     }
 
     try:
