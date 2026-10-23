@@ -1,14 +1,15 @@
 import logging
+import httpx
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-import google.generativeai as genai
 
 # --- الإعدادات ---
-TELEGRAM_TOKEN = "8865573357:AAF4FBlKqlB7Ah4Yx7d_dCGINWyRnW000lg" # توكن البوت الخاص بك
-GEMINI_API_KEY = "AQ.Ab8RN6IFKEMa8kzhKxxPXJ3QVWMTcaWo5Fxw7Uact38I63GUQQ" # مفتاح جيميني الذي أرسلته
+TELEGRAM_TOKEN = "8865573357:AAF4FBlKqlB7Ah4Yx7d_dCGINWyRnW000lg"
+GEMINI_API_KEY = "AQ.Ab8RN6LH8yARWWmiDPJosLhjHfeLG8VFIpUq0JW8bDQ9jD4fKQ"
 
-# إعداد جيميني
-genai.configure(api_key=GEMINI_API_KEY)
+# نموذج جيميني
+MODEL_NAME = "gemini-flash-latest"
+API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent"
 
 # --- البرومبت (عقيدة المنجنيق) ---
 SYSTEM_PROMPT = """
@@ -37,21 +38,14 @@ SYSTEM_PROMPT = """
 "نحن لا نستجدي الرضا، نحن نُعلن الحق، فمن شاء فليؤمن ومن شاء فليكفر."
 """
 
-# إعداد النموذج
-model = genai.GenerativeModel(
-    model_name="gemini-1.5-flash",
-    system_instruction=SYSTEM_PROMPT
-)
-
-# سجل الذاكرة المؤقتة
-user_sessions = {}
+# سجل المحادثات لكل مستخدم
+user_histories = {}
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    # بدء جلسة دردشة جديدة لكل مستخدم
-    user_sessions[user_id] = model.start_chat(history=[])
+    user_histories[user_id] = []
     
     welcome_text = (
         "بسم الله الرحمن الرحيم.\n\n"
@@ -66,30 +60,62 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_text = update.message.text
 
-    # إذا لم يكن للمستخدم جلسة، ننشئ له واحدة
-    if user_id not in user_sessions:
-        user_sessions[user_id] = model.start_chat(history=[])
+    if user_id not in user_histories:
+        user_histories[user_id] = []
+
+    # إضافة رسالة المستخدم للسجل
+    user_histories[user_id].append({"role": "user", "parts": [{"text": user_text}]})
+
+    # الاحتفاظ بآخر 10 رسائل فقط لمنع تجاوز الحد
+    if len(user_histories[user_id]) > 10:
+        user_histories[user_id] = user_histories[user_id][-10:]
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
+    # تجهيز البيانات بنفس صيغة الـ curl
+    payload = {
+        "system_instruction": {
+            "parts": [{"text": SYSTEM_PROMPT}]
+        },
+        "contents": user_histories[user_id],
+        "generationConfig": {
+            "temperature": 0.7,
+            "maxOutputTokens": 2048
+        }
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-goog-api-key": GEMINI_API_KEY
+    }
+
     try:
-        # إرسال الرسالة إلى جيميني
-        response = await user_sessions[user_id].send_message_async(user_text)
-        bot_reply = response.text
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(API_URL, json=payload, headers=headers)
+            response.raise_for_status()
+            data = response.json()
 
-        # إرسال الرد (مقسم إذا كان طويلاً)
-        if len(bot_reply) > 4000:
-            for i in range(0, len(bot_reply), 4000):
-                await update.message.reply_text(bot_reply[i:i+4000])
-        else:
-            await update.message.reply_text(bot_reply)
+            # استخراج النص من الرد
+            bot_reply = data['candidates'][0]['content']['parts'][0]['text']
 
+            # إضافة رد البوت للسجل
+            user_histories[user_id].append({"role": "model", "parts": [{"text": bot_reply}]})
+
+            # إرسال الرد (مقسم إذا كان طويلاً)
+            if len(bot_reply) > 4000:
+                for i in range(0, len(bot_reply), 4000):
+                    await update.message.reply_text(bot_reply[i:i+4000])
+            else:
+                await update.message.reply_text(bot_reply)
+
+    except httpx.HTTPStatusError as e:
+        await update.message.reply_text(f"❌ خطأ من السيرفر ({e.response.status_code}): {e.response.text}")
     except Exception as e:
-        await update.message.reply_text(f"❌ حدث خطأ في الاتصال بجيميني: {e}")
+        await update.message.reply_text(f"❌ حدث خطأ غير متوقع: {e}")
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user_sessions[user_id] = model.start_chat(history=[])
+    user_histories[user_id] = []
     await update.message.reply_text("تم محو الذاكرة. ابدأ من جديد.")
 
 def main():
