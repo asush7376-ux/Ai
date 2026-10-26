@@ -117,15 +117,6 @@ def count(chat_id=None) -> int:
         return _db().execute("SELECT COUNT(*) FROM items WHERE chat_id=?", (int(chat_id),)).fetchone()[0]
 
 
-def count_chats(chat_ids: list) -> int:
-    if not chat_ids:
-        return 0
-    with _lock:
-        q = ",".join("?" * len(chat_ids))
-        return _db().execute(f"SELECT COUNT(*) FROM items WHERE chat_id IN ({q})",
-                             [int(x) for x in chat_ids]).fetchone()[0]
-
-
 def max_msg_id(chat_id: int) -> int:
     with _lock:
         return _db().execute(
@@ -231,10 +222,9 @@ def item_from_ptb(m, include_text: bool = True):
 
 
 # ============================ البحث ============================
-def search(terms: list, media: str = "any", limit: int = 100, chats: list | None = None) -> list:
+def search(terms: list, media: str = "any", limit: int = 100) -> list:
     """
     terms: قائمة مفاهيم، كل مفهوم قائمة كلمات بديلة، مثال: [["البقرة","baqarah"],["سورة"]]
-    chats: قيود اختيارية على مصادر معينة (مجلد) — None يعني كل المكتبة.
     الترتيب بوزن نُدرة الكلمة (IDF): الكلمة النادرة أهم من الكلمة الشائعة.
     """
     groups = []
@@ -253,25 +243,18 @@ def search(terms: list, media: str = "any", limit: int = 100, chats: list | None
     if kinds:
         kind_sql = " AND kind IN (%s)" % ",".join("?" * len(kinds))
         kind_args = list(kinds)
-    chat_sql, chat_args = "", []
-    if chats:
-        chat_sql = " AND chat_id IN (%s)" % ",".join("?" * len(chats))
-        chat_args = [int(x) for x in chats]
-
-    where_extra = kind_sql + chat_sql
-    where_args = kind_args + chat_args
 
     with _lock:
         c = _db()
-        total = c.execute("SELECT COUNT(*) FROM items WHERE 1=1" + where_extra, where_args).fetchone()[0]
+        total = c.execute("SELECT COUNT(*) FROM items WHERE 1=1" + kind_sql, kind_args).fetchone()[0]
         if total == 0:
             return []
         active = []
         for vs in groups:
             cond = " OR ".join(["norm LIKE ?"] * len(vs))
             df = c.execute(
-                f"SELECT COUNT(*) FROM items WHERE ({cond})" + where_extra,
-                [f"%{v}%" for v in vs] + where_args,
+                f"SELECT COUNT(*) FROM items WHERE ({cond})" + kind_sql,
+                [f"%{v}%" for v in vs] + kind_args,
             ).fetchone()[0]
             if df:
                 active.append((vs, max(0.2, math.log((total + 1) / (df + 0.5)))))
@@ -280,8 +263,8 @@ def search(terms: list, media: str = "any", limit: int = 100, chats: list | None
         allv = [v for vs, _ in active for v in vs]
         cond = " OR ".join(["norm LIKE ?"] * len(allv))
         rows = c.execute(
-            f"SELECT * FROM items WHERE ({cond})" + where_extra + " LIMIT 5000",
-            [f"%{v}%" for v in allv] + where_args,
+            f"SELECT * FROM items WHERE ({cond})" + kind_sql + " LIMIT 5000",
+            [f"%{v}%" for v in allv] + kind_args,
         ).fetchall()
 
     scored = []
@@ -292,6 +275,34 @@ def search(terms: list, media: str = "any", limit: int = 100, chats: list | None
     keep = [(s, r) for s, r in scored if s >= top * 0.6]
     keep.sort(key=lambda x: (-round(x[0], 1), _natural_key(x[1]["name"]), x[1]["msg_id"]))
     return [r for _, r in keep[:limit]]
+
+
+def search_text(query: str, media: str = "any") -> list:
+    """بحث بالكلمة/الجملة كما كتبها المستخدم فقط (الهاشتاغ يُعامل ككلمة عادية). بلا حد للنتائج.
+    1) العبارة كاملة متتالية  2) إن لم توجد: المنشورات التي تحوي كل الكلمات"""
+    phrase = normalize(query)
+    if not phrase:
+        return []
+    kinds = KIND_GROUPS.get(media)
+    kind_sql, kind_args = "", []
+    if kinds:
+        kind_sql = " AND kind IN (%s)" % ",".join("?" * len(kinds))
+        kind_args = list(kinds)
+    order = " ORDER BY chat_id, msg_id"
+    with _lock:
+        c = _db()
+        rows = c.execute(
+            "SELECT * FROM items WHERE (' '||norm||' ') LIKE ?" + kind_sql + order,
+            [f"%{phrase}%"] + kind_args,
+        ).fetchall()
+        words = phrase.split()
+        if not rows and len(words) > 1:
+            cond = " AND ".join(["norm LIKE ?"] * len(words))
+            rows = c.execute(
+                f"SELECT * FROM items WHERE {cond}" + kind_sql + order,
+                [f"%{w}%" for w in words] + kind_args,
+            ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ============================ العرض ============================
