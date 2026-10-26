@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-بوت تيليجرام ذكاء اصطناعي (Gemini) — الإصدار 4
+بوت تيليجرام ذكاء اصطناعي (Gemini) — الإصدار 3
 
   • مودات برومبت يختارها المستخدم + أزرار ملونة تحت كل رد + نسخة أذكى
-  • 📚 المكتبة (منفصلة عن المودات): مجلدات داخلها قنوات/مجموعات، بحث ذكي يفهم العربية،
-    ويرسل الصوتيات/الفيديو/الصور/الملفات للمستخدم
-  • إرسال المحتوى: نسخ مباشر ← تحويل عبر الحساب إلى مجموعة التحويل ← رابط بعد 5 ثوانٍ
+  • 📚 المكتبة: يفهرس قنوات/مجموعات تتبع لك، ويبحث فيها بالذكاء الاصطناعي ويرسل
+    الصوتيات/الفيديو/الصور/الملفات للمستخدم (اختيار واحد أو إرسال الكل)
   • إن تعذّر دخول البوت للمصدر: ربط حساب حقيقي عبر Session (Telethon)
 
 الملفات: bot.py + library.py + userbot.py (+ make_session.py تُشغَّل على جهازك)
@@ -15,8 +14,7 @@
 اختيارية:
   GEMINI_MODEL, GEMINI_SMART_MODEL, GEMINI_FALLBACK_MODEL, DATA_FILE, LIBRARY_DB
   TG_API_ID, TG_API_HASH, TG_SESSION      (ربط الحساب — انظر userbot.py)
-  RELAY_GROUP  (معرف المجموعة الخاصة للتحويل: البوت + الحساب مشرفان فيها)
-  LIB_SEND_LIMIT (25)  LIB_SYNC_MINUTES (60، و0 يعطّل المزامنة الدورية)
+  RELAY_CHAT_ID (أيدي مجموعة التحويل، أو /setrelay)  LIB_SYNC_MINUTES (60، و0 يعطّل المزامنة الدورية)
 """
 import asyncio
 import json
@@ -57,20 +55,10 @@ FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-flash-lite-late
 ADMIN_IDS = {int(x) for x in re.findall(r"\d+", os.environ.get("ADMIN_IDS", ""))}
 DATA_FILE = os.environ.get("DATA_FILE", "data.json")
 MAX_HISTORY = 20
-LIB_SEND_LIMIT = int(os.environ.get("LIB_SEND_LIMIT", "25"))
+RELAY_CHAT_ID = os.environ.get("RELAY_CHAT_ID", "").strip()  # مجموعة التحويل الخاصة
 LIB_SYNC_MINUTES = int(os.environ.get("LIB_SYNC_MINUTES", "60"))
 LIB_PAGE = 8
 MAX_RELAY_BYTES = 49 * 1024 * 1024  # حد رفع البوت عبر Bot API
-
-
-def _env_int(name: str, default: int = 0) -> int:
-    try:
-        return int(os.environ.get(name, "") or default)
-    except ValueError:
-        return default
-
-
-RELAY_GROUP = _env_int("RELAY_GROUP")  # مجموعة التحويل الخاصة
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -96,14 +84,11 @@ def load_data() -> dict:
     d.setdefault("users", {})
     for m in d["modes"].values():
         m.setdefault("visible", True)
-    # المكتبة: منفصلة عن المودات — زر خاص بها + مجلدات داخلية
+    # المكتبة: الزر مخفي افتراضياً حتى يظهره الأدمن
     lib = d.setdefault("lib", {})
     lib.setdefault("visible", False)
     lib.setdefault("name", "المكتبة")
-    lib.setdefault("sources", {})   # {chat_id: {title, username, bot, session, access_hash, last_sync, folder}}
-    lib.setdefault("folders", {})   # {fid: {name}}
-    for s in lib["sources"].values():
-        s.setdefault("folder", None)  # None = خارج المجلدات (يُبحث ضمن «كل المكتبة» فقط)
+    lib.setdefault("sources", {})  # {chat_id: {title, username, bot, session, access_hash, last_sync}}
     return d
 
 
@@ -117,7 +102,7 @@ def save_data() -> None:
 DB = load_data()
 HISTORY: dict = {}
 LOCKS: dict = {}
-LIB_STATE: dict = {}  # chat_id -> {"ids","query","summary","page","ts","folder"}
+LIB_STATE: dict = {}  # chat_id -> {"ids","query","summary","page","ts"}
 TASKS: set = set()
 
 
@@ -128,6 +113,11 @@ def spawn(coro):
     return t
 
 
+def relay_chat_id():
+    v = DB["lib"].get("relay") or RELAY_CHAT_ID
+    return int(v) if str(v).lstrip("-").isdigit() else None
+
+
 def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
 
@@ -135,11 +125,9 @@ def is_admin(uid: int) -> bool:
 def prefs(chat_id: int) -> dict:
     key = str(chat_id)
     if key not in DB["users"]:
-        DB["users"][key] = {"mode": None, "smart": False, "lib": False, "lib_folder": None}
+        DB["users"][key] = {"mode": None, "smart": False, "lib": False}
         save_data()
-    p = DB["users"][key]
-    p.setdefault("lib_folder", None)
-    return p
+    return DB["users"][key]
 
 
 def allowed_modes(admin: bool) -> dict:
@@ -149,11 +137,6 @@ def allowed_modes(admin: bool) -> dict:
 def lib_available(admin: bool) -> bool:
     L = DB["lib"]
     return bool(L["sources"]) and (L["visible"] or admin)
-
-
-def folder_chat_ids(fid) -> list:
-    """معرّفات مصادر مجلد معين"""
-    return [int(c) for c, s in DB["lib"]["sources"].items() if s.get("folder") == fid]
 
 
 def resolve_mode(chat_id: int, admin: bool):
@@ -212,13 +195,16 @@ def reply_kb(chat_id: int) -> InlineKeyboardMarkup:
 
 
 def picker_view(chat_id: int, admin: bool, intro: str = "🎭 اختر المود الذي تريد التحدث معه:"):
-    """اختيار المودات فقط — المكتبة منفصلة وليست ضمنها"""
     allowed = allowed_modes(admin)
-    if not allowed:
+    lib_ok = lib_available(admin)
+    if not allowed and not lib_ok:
         return "⚠️ لا توجد مودات متاحة حالياً.", None
     p = prefs(chat_id)
-    current = None if p.get("lib") else p["mode"]
+    in_lib = bool(p.get("lib")) and lib_ok
+    current = None if in_lib else p["mode"]
     rows = []
+    if lib_ok:
+        rows.append([b(("✅ " if in_lib else "") + lib_button_label(), "libp", "success")])
     for mid, m in allowed.items():
         if mid == current:
             label, style = "✅ " + m["name"], "success"
@@ -229,27 +215,6 @@ def picker_view(chat_id: int, admin: bool, intro: str = "🎭 اختر المو�
         rows.append([b(label, f"pick:{mid}", style)])
     rows.append([b("❌ إغلاق", "closepick", "danger")])
     return intro, kb(*rows)
-
-
-def lib_home_view(chat_id: int):
-    """الواجهة الرئيسية للمكتبة: المجلدات + البحث في الكل"""
-    L = DB["lib"]
-    p = prefs(chat_id)
-    cur = p.get("lib_folder")
-    rows = [[b("🔎 كل المكتبة", "lfolder:all",
-               "success" if cur in (None, "all") else "primary")]]
-    for fid, f in L["folders"].items():
-        n = sum(1 for s in L["sources"].values() if s.get("folder") == fid)
-        mark = "✅ " if cur == fid else ""
-        rows.append([b(f"{mark}📁 {f['name']} ({n})", f"lfolder:{fid}",
-                       "success" if cur == fid else "primary")])
-    rows.append([b("🚪 الخروج من المكتبة", "libexit", "danger")])
-    text = (
-        f"📚 {L['name']}\n\n"
-        "اختر قسماً (مجلداً) للبحث داخله فقط، أو «كل المكتبة».\n"
-        "ثم اكتب ما تبحث عنه مثل: «كتاب الفتن» أو «سورة البقرة»"
-    )
-    return text, kb(*rows)
 
 
 def home_view():
@@ -263,8 +228,8 @@ def home_view():
         f"🎭 المودات: {len(modes)} (ظاهر للمستخدمين: {shown})\n"
         f"⭐ الافتراضي: {default['name'] if default else 'لا يوجد'}\n"
         f"🧠 النسخة الأذكى: {'مفعّلة' if DB['smart_enabled'] else 'معطّلة'}\n"
-        f"📚 المكتبة «{L['name']}»: {len(L['sources'])} مصدر · {len(L.get('folders', {}))} مجلد · "
-        f"{library.count()} عنصر · {'ظاهرة' if L['visible'] else 'مخفية'}\n"
+        f"📚 المكتبة «{L['name']}»: {len(L['sources'])} مصدر · {library.count()} عنصر · "
+        f"{'ظاهرة' if L['visible'] else 'مخفية'}\n"
         f"👥 المستخدمون: {len(DB['users'])}\n\n"
         "💡 للتجربة كمستخدم: /mode"
     )
@@ -444,7 +409,7 @@ async def respond(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int
         await bot.send_message(chat_id, "⏸ البوت متوقف حالياً، حاول لاحقاً.")
         return
 
-    # وضع المكتبة (منفصل عن المودات)
+    # وضع المكتبة
     p = prefs(chat_id)
     if p.get("lib"):
         if lib_available(admin):
@@ -455,7 +420,7 @@ async def respond(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int
 
     mid = resolve_mode(chat_id, admin)
     if not mid:
-        if not allowed_modes(admin):
+        if not allowed_modes(admin) and not lib_available(admin):
             await bot.send_message(
                 chat_id,
                 "⚠️ لا توجد مودات متاحة حالياً." + (" أضف مود من /start." if admin else ""),
@@ -507,62 +472,38 @@ async def respond(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int
         )
 
 
-# ============================ 📚 المكتبة: فهم الطلب بالذكاء الاصطناعي ============================
-# ملاحظة: لا نطلب من الذكاء الاصطناعي بناء كلمات البحث أبداً — نبحث بكلمات المستخدم
-# نفسها حرفياً، والـ AI يُستخدم فقط لتحديد القصد/النوع/الأرقام.
-LIB_PARSE_PROMPT = """أنت محلل طلبات لمكتبة وسائط (صوتيات، فيديو، صور، ملفات، نصوص).
-حلل رسالة المستخدم وأعد JSON فقط، بدون أي شرح، بهذا الشكل:
-{"intent":"search","media":"any","numbers":[],"want_all":false}
-
-القواعد:
-- intent واحد من: search (يطلب محتوى)، select (يختار رقماً أو أرقاماً من القائمة السابقة)، send_all (يطلب إرسال كل نتائج القائمة السابقة)، more (يطلب المزيد/الصفحة التالية)، other (تحية أو كلام لا علاقة له بالبحث).
-- media: audio (صوتية/تلاوة/مقطع صوتي/تسجيل)، video (فيديو/مقطع مرئي)، photo (صورة)، document (كتاب/ملف/pdf)، text (نص)، وإلا any.
-- want_all=true فقط إذا طلب صراحة إرسال كل النتائج (مثل: أرسل كل ... / كلها).
-- numbers: أرقام القائمة التي اختارها المستخدم مثل «الثالث» => [3] أو «1 و 4» => [1,4]."""
-
-_STOP = {"ارسل", "ارسلي", "اعطني", "عطني", "ابغي", "ابي", "اريد", "هات", "ممكن", "لو", "سمحت",
-         "من", "في", "عن", "علي", "الي", "هل", "يوجد", "عندك", "عندكم", "لي", "لنا"}
+# ============================ 📚 المكتبة: فهم الطلب (بدون إضافة كلمات) ============================
+_SEND_ALL = {"الكل", "ارسل الكل", "كلها", "ارسلها كلها", "ارسل كل النتايج", "الجميع", "all"}
+_MORE = {"المزيد", "التالي", "اكثر", "more", "next"}
 
 
-def fallback_terms(text: str) -> list:
-    return [[w] for w in library.normalize(text).split() if w not in _STOP and len(w) >= 2][:6]
-
-
-async def lib_understand(text: str, st) -> dict:
-    plan = {"intent": "search", "query": text[:60], "terms": fallback_terms(text),
-            "media": "any", "numbers": [], "want_all": False}
-
-    # اختصار: رقم فقط والقائمة موجودة
-    if st and re.fullmatch(r"\d{1,3}", library.normalize(text)):
-        plan.update(intent="select", numbers=[int(library.normalize(text))])
-        return plan
-
-    ctx = f"قائمة نتائج سابقة: {'نعم، عددها ' + str(len(st['ids'])) if st else 'لا'}\nرسالة المستخدم: {text}"
-    try:
-        raw, _ = await ask_gemini(
-            LIB_PARSE_PROMPT, [{"role": "user", "parts": [{"text": ctx}]}], json_mode=True
-        )
-        raw = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.M).strip()
-        data = json.loads(raw)
-        if isinstance(data, list) and data:
-            data = data[0]
-        if not isinstance(data, dict):
-            raise ValueError("not a dict")
-    except Exception as e:
-        log.warning("lib_understand fallback: %s", e)
-        return plan
-
-    if data.get("intent") in ("search", "select", "send_all", "more", "other"):
-        plan["intent"] = data["intent"]
-    if data.get("media") in library.KIND_GROUPS:
-        plan["media"] = data["media"]
-    plan["numbers"] = [int(n) for n in (data.get("numbers") or []) if str(n).lstrip("-").isdigit()]
-    plan["want_all"] = bool(data.get("want_all"))
-    # مهم: لا نستبدل كلمات البحث بشيء من الذكاء الاصطناعي — كلمات المستخدم حرفياً
+def lib_understand(text: str, st) -> dict:
+    """يبحث بالكلمة/الجملة كما أرسلها المستخدم فقط — بلا ذكاء اصطناعي ولا كلمات مضافة"""
+    n = library.normalize(text)
+    plan = {"intent": "search", "query": text.strip()[:60], "numbers": []}
+    if st:
+        nums = re.findall(r"\d{1,4}", n)
+        if nums and re.fullmatch(r"[\d\s,و]+", n.replace("ارسل", "").strip() or "x"):
+            plan.update(intent="select", numbers=[int(x) for x in nums])
+            return plan
+        if n in _SEND_ALL:
+            plan["intent"] = "send_all"
+            return plan
+        if n in _MORE:
+            plan["intent"] = "more"
+            return plan
     return plan
 
 
 # ============================ 📚 المكتبة: العرض والإرسال ============================
+def lib_intro_text() -> str:
+    return (
+        f"📚 {DB['lib']['name']}\n\n"
+        "اكتب ما تبحث عنه وسأجده لك (صوتيات، فيديو، صور، ملفات…)\n"
+        "اكتب الكلمة أو الجملة أو الهاشتاغ وسأبحث بها كما هي."
+    )
+
+
 def lib_list_view(chat_id: int, page: int):
     st = LIB_STATE[chat_id]
     ids = st["ids"]
@@ -597,7 +538,7 @@ def lib_list_view(chat_id: int, page: int):
     if nav:
         rows.append(nav)
     rows.append([
-        b(f"📤 إرسال الكل ({min(n, LIB_SEND_LIMIT)})", "lall", "success"),
+        b(f"📤 إرسال الكل ({n})", "lall", "success"),
         b("❌ إغلاق", "closepick", "danger"),
     ])
     return text, kb(*rows)
@@ -608,130 +549,134 @@ def lib_after_kb(chat_id: int):
     st = LIB_STATE.get(chat_id)
     if st and len(st["ids"]) > 1:
         rows.append([b("🔎 الرجوع للنتائج", f"lpg:{st['page']}", "primary")])
-    rows.append([b("📚 أقسام المكتبة", "lib", "success"), BACK_TO_CHAT])
+    rows.append([BACK_TO_CHAT])
     return kb(*rows)
 
 
-async def relay_item(bot, chat_id: int, it: dict, src: dict) -> None:
-    """آخر وسيلة: يحمّل الملف عبر الحساب ثم يرفعه البوت"""
-    if it.get("size") and it["size"] > MAX_RELAY_BYTES:
-        raise ValueError("big")
-    k = it["kind"]
-    if k == "text":
-        await bot.send_message(chat_id, (it.get("text") or it.get("name") or "")[:4096])
-        return
-    data = await userbot.download(int(it["chat_id"]), src.get("access_hash"), it["msg_id"])
-    if len(data) > MAX_RELAY_BYTES:
-        raise ValueError("big")
-    cap = (it.get("caption") or "")[:1000] or None
-    fname = it.get("filename") or f"{k}_{it['msg_id']}{it.get('ext') or ''}"
-    if k == "audio":
-        await bot.send_audio(chat_id, data, caption=cap, title=it.get("title"),
-                             performer=it.get("performer"), duration=it.get("duration"), filename=fname)
-    elif k == "voice":
-        await bot.send_voice(chat_id, data, caption=cap, duration=it.get("duration"))
-    elif k == "video":
-        await bot.send_video(chat_id, data, caption=cap, duration=it.get("duration"), filename=fname)
-    elif k == "animation":
-        await bot.send_animation(chat_id, data, caption=cap, filename=fname)
-    elif k == "photo":
-        await bot.send_photo(chat_id, data, caption=cap)
-    else:
-        await bot.send_document(chat_id, data, caption=cap, filename=fname)
-
-
-async def deliver(context, chat_id: int, rid: int) -> bool:
-    """
-    يرسل عنصراً من المكتبة للمستخدم بالترتيب:
-      1) نسخ مباشر من المصدر (إن كان البوت فيه)
-      2) الحساب يحوّل الرسالة إلى مجموعة التحويل RELAY_GROUP ثم البوت ينسخها للمستخدم
-      3) تحميل ورفع (آخر وسيلة)
-      4) رابط المصدر — يُرسل بعد 5 ثوانٍ من تعذّر كل ما سبق
-    """
-    bot = context.bot
-    it = library.get(rid)
-    if not it:
-        return False
-    src = DB["lib"]["sources"].get(str(it["chat_id"]))
-    if not src:
-        return False
-
-    # 1) النسخ المباشر
-    if src.get("bot"):
-        for _ in range(2):
+async def relay_many(bot, chat_id: int, items: list) -> dict:
+    """الحساب يحوّل الرسائل لمجموعة التحويل ثم البوت ينسخها للمستخدم. يرجع {rid: True}"""
+    done = {}
+    relay = relay_chat_id()
+    if not relay or not userbot.configured() or not items:
+        return done
+    cache = DB["lib"].setdefault("relay_cache", {})
+    need = {}
+    for it in items:
+        key = f"{it['chat_id']}:{it['msg_id']}"
+        if key not in cache and it["kind"] != "text":
+            need.setdefault(str(it["chat_id"]), []).append(it)
+    for cid, its in need.items():
+        src = DB["lib"]["sources"].get(cid) or {}
+        try:
+            new_ids = await userbot.forward_to_relay(
+                int(cid), src.get("access_hash"), [i["msg_id"] for i in its], relay
+            )
+            for i, nid in zip(its, new_ids):
+                if nid:
+                    cache[f"{i['chat_id']}:{i['msg_id']}"] = nid
+        except Exception as e:
+            log.warning("forward_to_relay failed: %s: %s", type(e).__name__, e)
+    save_data()
+    for it in items:
+        if it["kind"] == "text":
+            continue
+        key = f"{it['chat_id']}:{it['msg_id']}"
+        rmid = cache.get(key)
+        if not rmid:
+            continue
+        for _ in range(3):
             try:
-                await bot.copy_message(chat_id, from_chat_id=it["chat_id"], message_id=it["msg_id"])
-                return True
+                await bot.copy_message(chat_id, from_chat_id=relay, message_id=rmid)
+                done[it["id"]] = True
+                break
             except RetryAfter as e:
                 await asyncio.sleep(e.retry_after + 1)
             except (BadRequest, Forbidden) as e:
-                s = str(e).lower()
-                log.warning("copy_message failed: %s", e)
-                if "message to copy not found" in s or "message_id_invalid" in s:
-                    library.delete_item(rid)  # الرسالة حُذفت من المصدر
-                    return False
+                log.warning("copy from relay failed: %s", e)
+                cache.pop(key, None)  # حُذفت من المجموعة: تُحوَّل من جديد في المرة القادمة
                 break
+        await asyncio.sleep(0.3)
+    return done
 
-    # 2) التحويل عبر مجموعة التحويل (الحساب يحوّل → البوت ينسخ) — بدون تحميل أو رفع
-    if src.get("session") and userbot.configured() and RELAY_GROUP:
+
+async def send_text_item(bot, chat_id: int, it: dict) -> None:
+    """منشور نصي (مع الهاشتاغات وكل الكلمات التي معه) يُرسل كاملاً"""
+    t = it.get("text") or it.get("caption") or it.get("name") or ""
+    for part in chunks(t, 4000) or [""]:
+        if part.strip():
+            await bot.send_message(chat_id, part)
+
+
+async def direct_copy(bot, chat_id: int, it: dict, src: dict):
+    """True=نجح، False=فشل، None=الرسالة حُذفت"""
+    if not src.get("bot"):
+        return False
+    for _ in range(2):
         try:
-            relay_mid = await userbot.forward_to(
-                RELAY_GROUP, int(it["chat_id"]), src.get("access_hash"), it["msg_id"])
-            await asyncio.sleep(0.5)
-            await bot.copy_message(chat_id, from_chat_id=RELAY_GROUP, message_id=relay_mid)
+            await bot.copy_message(chat_id, from_chat_id=it["chat_id"], message_id=it["msg_id"])
             return True
         except RetryAfter as e:
             await asyncio.sleep(e.retry_after + 1)
-            try:
-                await bot.copy_message(chat_id, from_chat_id=RELAY_GROUP, message_id=relay_mid)
-                return True
-            except Exception as e2:
-                log.warning("relay group copy retry failed: %s", e2)
-        except Exception as e:
-            log.warning("relay group forward failed: %s: %s", type(e).__name__, e)
+        except (BadRequest, Forbidden) as e:
+            s = str(e).lower()
+            log.warning("copy_message failed: %s", e)
+            if "message to copy not found" in s or "message_id_invalid" in s:
+                return None
+            return False
+    return False
 
-    # 3) تحميل + رفع (أخيراً)
-    if src.get("session") and userbot.configured():
-        try:
-            await relay_item(bot, chat_id, it, src)
-            return True
-        except ValueError:
-            pass  # كبير الحجم → الرابط
-        except Exception as e:
-            log.warning("relay failed: %s: %s", type(e).__name__, e)
 
-    # 4) الرابط بعد 5 ثوانٍ
+async def send_link(bot, chat_id: int, it: dict, src: dict) -> bool:
     link = library.link_for(src, it)
     if link:
-        await asyncio.sleep(5)
-        await bot.send_message(
-            chat_id,
-            f"🔗 تعذّر الإرسال المباشر، إليك رابط الملف:\n{library.label(it)}\n{link}",
-        )
+        await bot.send_message(chat_id, f"🔗 {library.label(it)}\n{link}")
         return True
     return False
 
 
+async def deliver_items(context, chat_id: int, rids: list) -> int:
+    """الترتيب: نص كامل / نسخ مباشر من البوت ← تحويل عبر الحساب للمجموعة ثم البوت ← رابط"""
+    bot = context.bot
+    items = [i for i in library.get_many(rids)]
+    ok, pending = 0, []
+    for it in items:
+        src = DB["lib"]["sources"].get(str(it["chat_id"]))
+        if not src:
+            continue
+        if it["kind"] == "text":
+            await send_text_item(bot, chat_id, it)
+            ok += 1
+            continue
+        r = await direct_copy(bot, chat_id, it, src)
+        if r is True:
+            ok += 1
+            await asyncio.sleep(0.3)
+        elif r is None:
+            library.delete_item(it["id"])
+        else:
+            pending.append(it)
+    if pending:
+        # على دفعات حتى لا يطول التحويل الواحد
+        for i in range(0, len(pending), 50):
+            part = pending[i:i + 50]
+            done = await relay_many(bot, chat_id, part)
+            for it in part:
+                if done.get(it["id"]):
+                    ok += 1
+                elif await send_link(bot, chat_id, it, DB["lib"]["sources"].get(str(it["chat_id"])) or {}):
+                    ok += 1
+    return ok
+
+
+async def deliver(context, chat_id: int, rid: int) -> bool:
+    return await deliver_items(context, chat_id, [rid]) > 0
+
+
 async def lib_send_many(context, chat_id: int, ids: list, total: int | None = None) -> None:
     bot = context.bot
-    note = f"📤 جاري إرسال {len(ids)} ملف…"
-    if total and total > len(ids):
-        note += f"\n(الحد الأقصى {LIB_SEND_LIMIT} في المرة، من أصل {total})"
-    await bot.send_message(chat_id, note)
-    ok = 0
-    for rid in ids:
-        if await deliver(context, chat_id, rid):
-            ok += 1
-        await asyncio.sleep(0.4)
+    await bot.send_message(chat_id, f"📤 جاري إرسال {len(ids)} ملف…")
+    ok = await deliver_items(context, chat_id, ids)
     await bot.send_message(chat_id, f"✅ تم إرسال {ok} من {len(ids)}.", reply_markup=lib_after_kb(chat_id))
-
-
-def lib_scope(chat_id: int):
-    """نطاق البحث: معرّفات مصادر المجلد الحالي أو None = كل المكتبة"""
-    fid = prefs(chat_id).get("lib_folder")
-    if fid and fid in DB["lib"]["folders"]:
-        return folder_chat_ids(fid)
-    return None
 
 
 async def lib_handle(context, chat_id: int, admin: bool, text: str) -> None:
@@ -742,14 +687,9 @@ async def lib_handle(context, chat_id: int, admin: bool, text: str) -> None:
         st = None
 
     await bot.send_chat_action(chat_id, ChatAction.TYPING)
-    plan = await lib_understand(text, st)
+    plan = lib_understand(text, st)
     intent = plan["intent"]
-    back = kb([b("📚 أقسام المكتبة", "lib", "success")], [BACK_TO_CHAT])
-
-    if intent == "other":
-        t, m = lib_home_view(chat_id)
-        await bot.send_message(chat_id, t, reply_markup=m)
-        return
+    back = kb([BACK_TO_CHAT])
 
     if st and intent == "select":
         nums = [n for n in plan["numbers"] if 1 <= n <= len(st["ids"])]
@@ -759,28 +699,19 @@ async def lib_handle(context, chat_id: int, admin: bool, text: str) -> None:
         await lib_send_many(context, chat_id, [st["ids"][n - 1] for n in nums])
         return
     if st and intent == "send_all":
-        await lib_send_many(context, chat_id, st["ids"][:LIB_SEND_LIMIT], total=len(st["ids"]))
+        await lib_send_many(context, chat_id, st["ids"])
         return
     if st and intent == "more":
         t, m = lib_list_view(chat_id, st["page"] + 1)
         await bot.send_message(chat_id, t, reply_markup=m)
         return
 
-    # ---------- بحث جديد (بكلمات المستخدم نفسها — بلا إضافات) ----------
-    scope = lib_scope(chat_id)
-    rows = library.search(plan["terms"], plan["media"], chats=scope)
-    # تقديم النتائج التي تطابق العبارة كاملة كما كتبها المستخدم
-    qn = library.normalize(text)
-    if qn:
-        rows.sort(key=lambda r: 0 if qn in (r["norm"] or "") else 1)
+    # ---------- بحث جديد ----------
+    rows = library.search_text(text)
     query = plan["query"]
     if not rows:
         await bot.send_message(
-            chat_id,
-            f"😕 لم أجد شيئاً عن «{query}»"
-            + (f" في هذا القسم" if scope else f" في {DB['lib']['name']}")
-            + ".\nجرّب كلمات أخرى.",
-            reply_markup=back,
+            chat_id, f"😕 لم أجد شيئاً عن «{query}» في {DB['lib']['name']}.\nجرّب كلمات أخرى.", reply_markup=back
         )
         return
 
@@ -795,13 +726,8 @@ async def lib_handle(context, chat_id: int, admin: bool, text: str) -> None:
 
     LIB_STATE[chat_id] = {
         "ids": [r["id"] for r in rows], "query": query, "summary": library.summarize(rows),
-        "page": 0, "ts": time.time(), "folder": prefs(chat_id).get("lib_folder"),
+        "page": 0, "ts": time.time(),
     }
-    if plan["want_all"] and n <= LIB_SEND_LIMIT:
-        await bot.send_message(chat_id, f"🔎 وجدت {n} نتيجة عن «{query}» ({LIB_STATE[chat_id]['summary']}).")
-        await lib_send_many(context, chat_id, LIB_STATE[chat_id]["ids"])
-        return
-
     t, m = lib_list_view(chat_id, 0)
     await bot.send_message(chat_id, t, reply_markup=m)
 
@@ -880,7 +806,7 @@ def forward_chat_id(msg):
     return ch.id if ch else None
 
 
-async def try_add_source(bot, ref: str, fwd, expect_cid=None, notify_id=None, folder=None):
+async def try_add_source(bot, ref: str, fwd, expect_cid=None, notify_id=None):
     """يربط مصدراً: البوت أولاً، ثم الحساب (Session). يرجع (نجح؟، رسالة)"""
     cid = title = username = ahash = None
     bot_ok = sess_ok = False
@@ -920,7 +846,7 @@ async def try_add_source(bot, ref: str, fwd, expect_cid=None, notify_id=None, fo
     key = str(cid)
     src = DB["lib"]["sources"].setdefault(
         key, {"title": title, "username": username, "bot": False, "session": False,
-              "access_hash": None, "last_sync": 0, "folder": None}
+              "access_hash": None, "last_sync": 0}
     )
     src["title"] = title or src["title"]
     if username:
@@ -930,13 +856,9 @@ async def try_add_source(bot, ref: str, fwd, expect_cid=None, notify_id=None, fo
     if sess_ok:
         src["session"] = True
         src["access_hash"] = ahash
-    if folder is not None:
-        src["folder"] = folder
     save_data()
 
     msg = [f"✅ تم ربط «{src['title']}»", f"{'🤖 بوت ' if src['bot'] else ''}{'👤 حساب' if src['session'] else ''}"]
-    if src.get("folder") and src["folder"] in DB["lib"]["folders"]:
-        msg.append(f"📁 المجلد: {DB['lib']['folders'][src['folder']]['name']}")
     if sess_ok:
         spawn(sync_source(bot, key, notify_id))
         msg.append("⏳ بدأت فهرسة المحتوى القديم في الخلفية وسأخبرك عند الانتهاء.")
@@ -975,62 +897,29 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_data()
 
 
-# ---------- واجهات إدارة المكتبة (للأدمن) ----------
+# ---------- واجهات إدارة المكتبة ----------
 def lib_admin_view():
     L = DB["lib"]
     sess = "✅ مُهيّأ" if userbot.configured() else f"⚪ غير مُهيّأ — {userbot.why_not()}"
-    relay = f"✅ {RELAY_GROUP}" if RELAY_GROUP else "⚪ غير محدد — أضف RELAY_GROUP في المتغيرات"
     text = (
         "📚 إدارة المكتبة\n\n"
         f"الزر للمستخدمين: «{L['name']}» — {'👁 ظاهر' if L['visible'] else '🚫 مخفي'}\n"
         f"📂 المصادر: {len(L['sources'])}\n"
-        f"🗂 المجلدات: {len(L.get('folders', {}))}\n"
-        f"🗃 العناصر المفهرسة: {library.count()}\n"
+        f"🗂 العناصر المفهرسة: {library.count()}\n"
         f"👤 حساب Session: {sess}\n"
-        f"🔁 مجموعة التحويل: {relay}\n\n"
-        "💡 اجعل البوت والحساب مشرفين في مجموعة التحويل ليعمل التحويل بدون تحميل."
+        f"👥 مجموعة التحويل: {relay_chat_id() or '❌ غير محددة (/setrelay)'}\n\n"
+        "💡 لكي يرى البوت القناة أضفه إليها كمشرف. للمحتوى القديم أو للمصادر التي لا يدخلها البوت اربط حساب Session."
     )
     rows = [
         [b("🚫 إخفاء الزر", "lavis", "danger") if L["visible"] else b("👁 إظهار الزر", "lavis", "success")],
-        [b("✏️ تسمية المكتبة", "laname", "primary")],
-        [b("🗂 المجلدات", "laf", "primary"), b("📂 المصادر", "lasrc", "primary")],
-        [b("➕ إضافة مصدر", "laadd", "success")],
+        [b("✏️ تسمية الزر", "laname", "primary")],
+        [b("➕ إضافة مصدر", "laadd", "success"), b("📂 المصادر", "lasrc", "primary")],
     ]
     if userbot.configured():
-        rows.append([b("🔄 مزامنة الكل", "lasync:all", "primary"), b("🧪 فحص الحساب", "lacheck")])
+        rows.append([b("🔄 مزامنة الكل", "lasync:all", "primary")])
+    rows.append([b("📡 فحص اتصال الحساب والمجموعة", "lacheck", "primary")])
     rows.append([b("🏠 الرئيسية", "home")])
     return text, kb(*rows)
-
-
-def lib_folders_view():
-    folders = DB["lib"]["folders"]
-    if not folders:
-        return ("🗂 لا توجد مجلدات بعد. أنشئ مجلداً وضع فيه مصادر مشابهة "
-                "(مثل: قرآن، محاضرات، كتب)."), kb(
-            [b("➕ مجلد جديد", "lafadd", "success")], [b("⬅️ رجوع", "la")])
-    rows = []
-    for fid, f in folders.items():
-        cids = folder_chat_ids(fid)
-        cnt = library.count_chats(cids)
-        rows.append([b(f"📁 {f['name']} ({len(cids)} مصدر · {cnt} عنصر)", f"lafv:{fid}", "primary")])
-    rows.append([b("➕ مجلد جديد", "lafadd", "success"), b("⬅️ رجوع", "la")])
-    return "🗂 مجلدات المكتبة:", kb(*rows)
-
-
-def lib_folder_view(fid: str, notice: str = ""):
-    f = DB["lib"]["folders"][fid]
-    cids = [c for c, s in DB["lib"]["sources"].items() if s.get("folder") == fid]
-    cnt = library.count_chats([int(c) for c in cids])
-    names = "\n".join(f"• {DB['lib']['sources'][c]['title']} ({library.count(int(c))})" for c in cids) or "— لا مصادر في هذا المجلد —"
-    text = (notice + "\n\n" if notice else "") + (
-        f"📁 {f['name']}\n🗂 العناصر: {cnt}\n\nالمصادر:\n{names}"
-    )
-    markup = kb(
-        [b("✏️ إعادة تسمية", f"lafren:{fid}", "primary"), b("🗑 حذف المجلد", f"lafdel:{fid}", "danger")],
-        [b("➕ إضافة مصدر لهذا المجلد", f"lafaddsrc:{fid}", "success")],
-        [b("⬅️ رجوع", "laf")],
-    )
-    return text, markup
 
 
 def lib_sources_view():
@@ -1040,9 +929,7 @@ def lib_sources_view():
     rows = []
     for cid, s in srcs.items():
         flags = ("🤖" if s.get("bot") else "") + ("👤" if s.get("session") else "")
-        fol = DB["lib"]["folders"].get(s.get("folder"), {}).get("name") if s.get("folder") else ""
-        tag = f" · 📁{fol}" if fol else ""
-        rows.append([b(f"{flags} {s['title']} ({library.count(int(cid))}){tag}", f"las:{cid}", "primary")])
+        rows.append([b(f"{flags} {s['title']} ({library.count(int(cid))})", f"las:{cid}", "primary")])
     rows.append([b("➕ إضافة مصدر", "laadd", "success"), b("⬅️ رجوع", "la")])
     return "📂 المصادر (🤖 البوت داخلها · 👤 الحساب داخلها):", kb(*rows)
 
@@ -1050,36 +937,22 @@ def lib_sources_view():
 def lib_source_view(cid: str, notice: str = ""):
     s = DB["lib"]["sources"][cid]
     last = time.strftime("%Y-%m-%d %H:%M", time.localtime(s["last_sync"])) if s.get("last_sync") else "—"
-    fol = DB["lib"]["folders"].get(s.get("folder"), {}).get("name") if s.get("folder") else "بدون مجلد"
     text = (notice + "\n\n" if notice else "") + (
         f"📂 {s['title']}\n"
         f"🆔 {cid}\n"
         f"{'🔗 @' + s['username'] if s.get('username') else '🔒 خاص'}\n"
-        f"📁 المجلد: {fol}\n"
         f"🤖 البوت: {'✅ داخله' if s.get('bot') else '❌'}\n"
         f"👤 الحساب: {'✅ داخله' if s.get('session') else '❌'}\n"
         f"🗂 العناصر: {library.count(int(cid))}\n"
         f"آخر مزامنة: {last}"
     )
-    rows = [
-        [b("📁 نقل إلى مجلد", f"lafm:{cid}", "primary")],
-    ]
+    rows = []
     if s.get("session") and userbot.configured():
         rows.append([b("🔄 مزامنة الآن", f"lasync:{cid}", "success")])
     rows.append([b("👤 ربط/تحديث الحساب بهذا المصدر", f"lalink:{cid}", "primary")])
     rows.append([b("🗑 إزالة المصدر", f"ladel:{cid}", "danger")])
     rows.append([b("⬅️ رجوع", "lasrc")])
     return text, kb(*rows)
-
-
-def lib_move_view(cid: str):
-    s = DB["lib"]["sources"][cid]
-    rows = [[b("🚫 بدون مجلد", f"lafm2:{cid}:none", "primary")]]
-    for fid, f in DB["lib"]["folders"].items():
-        mark = "✅ " if s.get("folder") == fid else ""
-        rows.append([b(f"{mark}📁 {f['name']}", f"lafm2:{cid}:{fid}", "success" if s.get("folder") == fid else None)])
-    rows.append([b("⬅️ رجوع", f"las:{cid}")])
-    return f"📁 نقل «{s['title']}» إلى أي مجلد؟", kb(*rows)
 
 
 # ============================ الأوامر ============================
@@ -1104,9 +977,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     allowed = allowed_modes(False)
-    if not allowed and not lib_available(False):
+    lib_ok = lib_available(False)
+    if not allowed and not lib_ok:
         await update.message.reply_text("⚠️ لا توجد مودات متاحة حالياً.")
-    elif len(allowed) == 1:
+    elif len(allowed) + (1 if lib_ok else 0) == 1 and allowed:
         resolve_mode(chat_id, False)
         await update.message.reply_text("👋 أهلاً بك! أنا مساعدك الذكي.\nاكتب رسالتك وسأرد عليك مباشرة.")
     else:
@@ -1123,19 +997,64 @@ async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(t, reply_markup=m)
 
 
-async def cmd_library(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """فتح المكتبة المنفصلة"""
-    uid = update.effective_user.id
-    chat_id = update.effective_chat.id
-    if not lib_available(is_admin(uid)):
-        await update.message.reply_text("⚠️ المكتبة غير متاحة حالياً.")
+async def connection_report(bot) -> str:
+    lines = ["📡 حالة الاتصال\n"]
+    relay = relay_chat_id()
+    acc_ok = False
+    if not userbot.configured():
+        lines.append(f"👤 الحساب: ❌ غير مُهيّأ — {userbot.why_not()}")
+    else:
+        try:
+            lines.append(f"👤 الحساب: ✅ متصل — {await userbot.check()}")
+            acc_ok = True
+        except Exception as e:
+            lines.append(f"👤 الحساب: ❌ {type(e).__name__}: {e}")
+    if not relay:
+        lines.append("👥 المجموعة: ❌ لم تُحدَّد — ضع RELAY_CHAT_ID أو أرسل /setrelay -100…")
+        return "\n".join(lines)
+    bot_ok = False
+    try:
+        chat = await bot.get_chat(relay)
+        mem = await bot.get_chat_member(relay, bot.id)
+        bot_ok = mem.status in ("administrator", "member", "creator")
+        lines.append(f"🤖 البوت في المجموعة «{chat.title}»: {'✅ ' + mem.status if bot_ok else '❌ ' + mem.status}")
+    except Exception as e:
+        lines.append(f"🤖 البوت في المجموعة: ❌ {e}")
+    if acc_ok:
+        try:
+            title = await userbot.check_relay(relay)
+            lines.append(f"👤 الحساب في المجموعة «{title}»: ✅")
+        except Exception as e:
+            acc_ok = False
+            lines.append(f"👤 الحساب في المجموعة: ❌ {e}")
+    if acc_ok and bot_ok:
+        try:
+            mid = await userbot.send_test(relay)
+            await bot.delete_message(relay, mid)
+            lines.append("🔁 تجربة التحويل (الحساب ← المجموعة ← البوت): ✅ تعمل")
+        except Exception as e:
+            lines.append(f"🔁 تجربة التحويل: ❌ البوت لا يرى رسائل الحساب ({e}) — اجعل البوت مشرفاً")
+    return "\n".join(lines)
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
         return
-    p = prefs(chat_id)
-    p["lib"] = True
+    m = await update.message.reply_text("⏳ جاري الفحص…")
+    await m.edit_text(await connection_report(context.bot))
+
+
+async def cmd_setrelay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    arg = (context.args or [""])[0]
+    if not arg.lstrip("-").isdigit():
+        await update.message.reply_text("أرسل: /setrelay -1001234567890")
+        return
+    DB["lib"]["relay"] = arg
+    DB["lib"]["relay_cache"] = {}
     save_data()
-    LIB_STATE.pop(chat_id, None)
-    t, m = lib_home_view(chat_id)
-    await update.message.reply_text(t, reply_markup=m)
+    await update.message.reply_text(f"✅ مجموعة التحويل: {arg}\nافحص الاتصال: /status")
 
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1161,6 +1080,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat = update.effective_chat
 
+    if chat.id == relay_chat_id():
+        return  # مجموعة التحويل: لا يُرد فيها
     if str(chat.id) in DB["lib"]["sources"]:
         return  # مصدر مكتبة: يُفهرس فقط ولا يُرد فيه
 
@@ -1235,37 +1156,14 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE,
         save_data()
         context.user_data.pop("state", None)
         t, m = lib_admin_view()
-        await reply("✅ تم تغيير اسم المكتبة.\n\n" + t, reply_markup=m)
-
-    elif step in ("folder_add", "folder_ren"):
-        if not text or len(text) > 30:
-            await reply("⚠️ أرسل اسماً من 1 إلى 30 حرفاً:", reply_markup=CANCEL_KB)
-            return
-        if step == "folder_add":
-            fid = uuid.uuid4().hex[:8]
-            DB["lib"]["folders"][fid] = {"name": text}
-            save_data()
-            context.user_data.pop("state", None)
-            t, m = lib_folder_view(fid, "✅ تم إنشاء المجلد")
-            await reply(t, reply_markup=m)
-        else:
-            fid = st["fid"]
-            if fid not in DB["lib"]["folders"]:
-                await reply("⚠️ هذا المجلد لم يعد موجوداً.")
-                return
-            DB["lib"]["folders"][fid]["name"] = text
-            save_data()
-            context.user_data.pop("state", None)
-            t, m = lib_folder_view(fid, "✅ تمت إعادة التسمية")
-            await reply(t, reply_markup=m)
+        await reply("✅ تم تغيير اسم الزر.\n\n" + t, reply_markup=m)
 
     elif step in ("lib_add", "lib_link"):
         fwd = forward_chat_id(update.message)
         ref = "" if fwd else text
         await reply("⏳ جاري الفحص…")
         ok, report = await try_add_source(
-            context.bot, ref, fwd, expect_cid=st.get("cid"), notify_id=update.effective_user.id,
-            folder=st.get("folder"),
+            context.bot, ref, fwd, expect_cid=st.get("cid"), notify_id=update.effective_user.id
         )
         if ok:
             context.user_data.pop("state", None)
@@ -1275,8 +1173,7 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
 
 # ============================ الأزرار ============================
-USER_CMDS = {"chg", "pick", "smart", "newchat", "closepick",
-             "lib", "libp", "libexit", "lfolder", "lp", "lpg", "lall"}
+USER_CMDS = {"chg", "pick", "smart", "newchat", "closepick", "lib", "libp", "lp", "lpg", "lall"}
 
 
 async def on_user_button(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str, arg: str):
@@ -1338,7 +1235,7 @@ async def on_user_button(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
         except BadRequest:
             pass
 
-    # ---------- المكتبة (منفصلة عن المودات) ----------
+    # ---------- المكتبة ----------
     elif cmd in ("lib", "libp"):
         if not DB["enabled"] and not admin:
             await q.answer("⏸ البوت متوقف حالياً", show_alert=True)
@@ -1351,40 +1248,11 @@ async def on_user_button(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
         save_data()
         LIB_STATE.pop(chat_id, None)
         await q.answer()
-        t, m = lib_home_view(chat_id)
+        markup = kb([BACK_TO_CHAT])
         if cmd == "libp":
-            await edit(q, t, m)
+            await edit(q, lib_intro_text(), markup)
         else:
-            await context.bot.send_message(chat_id, t, reply_markup=m)
-
-    elif cmd == "libexit":
-        p = prefs(chat_id)
-        p["lib"] = False
-        p["lib_folder"] = None
-        save_data()
-        LIB_STATE.pop(chat_id, None)
-        await q.answer("🚪 خرجت من المكتبة")
-        await edit(q, "🎭 عدت للمحادثة مع الذكاء.\nاكتب رسالتك 👇")
-
-    elif cmd == "lfolder":
-        if not lib_available(admin):
-            await q.answer("المكتبة غير متاحة حالياً", show_alert=True)
-            return
-        p = prefs(chat_id)
-        p["lib"] = True
-        p["lib_folder"] = None if arg == "all" else (arg if arg in DB["lib"]["folders"] else None)
-        save_data()
-        LIB_STATE.pop(chat_id, None)
-        await q.answer()
-        if arg == "all":
-            name = f"🔎 كل {DB['lib']['name']}"
-        else:
-            name = f"📁 {DB['lib']['folders'][arg]['name']}"
-        await context.bot.send_message(
-            chat_id,
-            f"{name}\n\n✍️ اكتب ما تبحث عنه وسأبحث في هذا القسم فقط.\nمثال: «كتاب الفتن»",
-            reply_markup=kb([b("📚 أقسام المكتبة", "lib", "primary")], [BACK_TO_CHAT]),
-        )
+            await context.bot.send_message(chat_id, lib_intro_text(), reply_markup=markup)
 
     elif cmd in ("lp", "lpg", "lall"):
         if not lib_available(admin):
@@ -1406,7 +1274,7 @@ async def on_user_button(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
         if cmd == "lpg":
             await edit(q, *lib_list_view(chat_id, int(arg) if arg.lstrip("-").isdigit() else 0))
         else:
-            await lib_send_many(context, chat_id, st["ids"][:LIB_SEND_LIMIT], total=len(st["ids"]))
+            await lib_send_many(context, chat_id, st["ids"])
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1415,7 +1283,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer()
         return
     cmd, _, arg = (q.data or "").partition(":")
-    arg1, _, arg2 = arg.partition(":")
 
     if cmd in USER_CMDS:
         await on_user_button(update, context, cmd, arg)
@@ -1428,11 +1295,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if cmd == "lacheck":
         await q.answer("⏳ جاري الفحص…")
-        try:
-            name = await userbot.check()
-            await context.bot.send_message(q.message.chat_id, f"✅ الحساب متصل: {name}")
-        except Exception as e:
-            await context.bot.send_message(q.message.chat_id, f"❌ {type(e).__name__}: {e}")
+        await context.bot.send_message(q.message.chat_id, await connection_report(context.bot))
         return
 
     await q.answer()
@@ -1472,90 +1335,17 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif cmd == "laname":
         context.user_data["state"] = {"step": "lib_name"}
-        await edit(q, "✏️ أرسل الاسم الجديد للمكتبة (مثل: المكتبة الصوتية):", CANCEL_KB)
-
-    elif cmd == "laf":  # المجلدات
-        context.user_data.pop("state", None)
-        await edit(q, *lib_folders_view())
-
-    elif cmd == "lafadd":
-        context.user_data["state"] = {"step": "folder_add"}
-        await edit(q, "✏️ أرسل اسم المجلد الجديد\nمثال: قرآن كريم", CANCEL_KB)
-
-    elif cmd == "lafren":
-        if arg not in DB["lib"]["folders"]:
-            await edit(q, "⚠️ المجلد غير موجود.", kb([b("⬅️ رجوع", "laf")]))
-            return
-        context.user_data["state"] = {"step": "folder_ren", "fid": arg}
-        await edit(q, "✏️ أرسل الاسم الجديد للمجلد:", CANCEL_KB)
-
-    elif cmd == "lafv":
-        if arg not in DB["lib"]["folders"]:
-            await edit(q, "⚠️ المجلد غير موجود.", kb([b("⬅️ رجوع", "laf")]))
-            return
-        await edit(q, *lib_folder_view(arg))
-
-    elif cmd == "lafdel":
-        if arg not in DB["lib"]["folders"]:
-            await edit(q, "⚠️ المجلد غير موجود.", kb([b("⬅️ رجوع", "laf")]))
-            return
-        name = DB["lib"]["folders"][arg]["name"]
-        await edit(
-            q,
-            f"⚠️ حذف المجلد «{name}»؟\n(المصادر داخله لن تُحذف، ستنتقل إلى «بدون مجلد»)",
-            kb([b("🗑 نعم، احذف", f"lafdelok:{arg}", "danger"), b("↩️ تراجع", f"lafv:{arg}", "primary")]),
-        )
-
-    elif cmd == "lafdelok":
-        fid = arg
-        if fid in DB["lib"]["folders"]:
-            for s in DB["lib"]["sources"].values():
-                if s.get("folder") == fid:
-                    s["folder"] = None
-            DB["lib"]["folders"].pop(fid, None)
-            save_data()
-        await edit(q, *lib_folders_view())
-
-    elif cmd == "lafaddsrc":  # إضافة مصدر مباشرة داخل مجلد
-        if arg not in DB["lib"]["folders"]:
-            await edit(q, "⚠️ المجلد غير موجود.", kb([b("⬅️ رجوع", "laf")]))
-            return
-        context.user_data["state"] = {"step": "lib_add", "folder": arg}
-        await edit(
-            q,
-            f"➕ أرسل أحد التالي لإضافته إلى مجلد «{DB['lib']['folders'][arg]['name']}»:\n"
-            "• @username أو رابط القناة العامة\n"
-            "• رابط دعوة (t.me/+…) — يحتاج حساب Session\n"
-            "• أو حوّل (Forward) أي رسالة من القناة إلى هنا\n\n"
-            "⚠️ لكي يقرأ البوت القناة أضفه إليها كمشرف.",
-            CANCEL_KB,
-        )
-
-    elif cmd == "lafm":  # اختيار مجلد لمصدر
-        if arg not in DB["lib"]["sources"]:
-            await edit(q, "⚠️ المصدر غير موجود.", kb([b("⬅️ رجوع", "lasrc")]))
-            return
-        await edit(q, *lib_move_view(arg))
-
-    elif cmd == "lafm2":  # تنفيذ النقل
-        cid, fid = arg1, arg2
-        if cid not in DB["lib"]["sources"]:
-            await edit(q, "⚠️ المصدر غير موجود.", kb([b("⬅️ رجوع", "lasrc")]))
-            return
-        DB["lib"]["sources"][cid]["folder"] = None if fid == "none" else fid
-        save_data()
-        await edit(q, *lib_source_view(cid, "✅ تم نقل المصدر"))
+        await edit(q, "✏️ أرسل الاسم الجديد لزر المكتبة (مثل: المصحف الصوتي):", CANCEL_KB)
 
     elif cmd == "laadd":
-        context.user_data["state"] = {"step": "lib_add", "folder": None}
+        context.user_data["state"] = {"step": "lib_add"}
         await edit(
             q,
             "➕ أرسل أحد التالي:\n"
             "• @username أو رابط القناة العامة\n"
             "• رابط دعوة (t.me/+…) — يحتاج حساب Session\n"
             "• أو حوّل (Forward) أي رسالة من القناة إلى هنا\n\n"
-            "⚠️ لكي يقرأ البوت القناة أضفه إليها كمشرف.\n"
-            "💡 يمكنك لاحقاً نقل المصدر إلى مجلد من صفحته.",
+            "⚠️ لكي يقرأ البوت القناة أضفه إليها كمشرف.",
             CANCEL_KB,
         )
 
@@ -1675,9 +1465,9 @@ async def post_init(app: Application):
         [
             BotCommand("start", "بدء"),
             BotCommand("mode", "تغيير المود"),
-            BotCommand("library", "المكتبة"),
             BotCommand("new", "محادثة جديدة"),
             BotCommand("id", "معرفة رقمك"),
+            BotCommand("status", "فحص اتصال الحساب والمجموعة (للأدمن)"),
         ]
     )
     if LIB_SYNC_MINUTES > 0:
@@ -1724,8 +1514,9 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("admin", cmd_start))
     app.add_handler(CommandHandler("mode", cmd_mode))
-    app.add_handler(CommandHandler("library", cmd_library))
     app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("setrelay", cmd_setrelay))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(on_button))
@@ -1734,9 +1525,9 @@ def main():
     app.add_error_handler(on_error)
 
     log.info(
-        "Bot v4 started. Admins: %s | Fast: %s | Smart: %s | Fallback: %s | Session: %s | RelayGroup: %s",
+        "Bot v3 started. Admins: %s | Fast: %s | Smart: %s | Fallback: %s | Session: %s",
         sorted(ADMIN_IDS), GEMINI_MODEL, SMART_MODEL, FALLBACK_MODEL,
-        "on" if userbot.configured() else "off", RELAY_GROUP or "off",
+        "on" if userbot.configured() else "off",
     )
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
