@@ -1,14 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 ربط حساب حقيقي (Telethon) للانضمام إلى القنوات/المجموعات وقراءة محتواها القديم.
-
-المتغيرات:
-  TG_API_ID, TG_API_HASH : من my.telegram.org  (API development tools)
-  TG_SESSION             : نص الجلسة StringSession (يُنشأ بالسكربت make_session.py)
-  TG_SESSION_FILE        : بديل: مسار ملف .session (بدون الامتداد) — لا تضعه في GitHub أبداً
-
-ملاحظة أمان: الجلسة = صلاحية كاملة على الحساب. استخدم حساباً ثانوياً، ولا تشاركها مع أحد.
-الاتصال هنا «عند الحاجة فقط» (يتصل ثم يقطع) لتقليل خطر تعارض النسختين وقت إعادة النشر.
 """
 import asyncio
 import logging
@@ -33,7 +25,7 @@ try:
     from telethon.tl.types import InputPeerChannel, InputPeerChat, PeerChannel, PeerChat
 
     HAVE_TELETHON = True
-except Exception:  # غير مثبتة
+except Exception:
     HAVE_TELETHON = False
 
 
@@ -55,13 +47,10 @@ def why_not() -> str:
     return ""
 
 
-# ============================ الجلسة عند الحاجة ============================
 _lock = asyncio.Lock()
 
 
 class session:
-    """async with session() as client: ..."""
-
     async def __aenter__(self):
         if not configured():
             raise UserbotError(why_not())
@@ -72,7 +61,7 @@ class session:
             await client.connect()
             if not await client.is_user_authorized():
                 await client.disconnect()
-                raise UserbotError("الجلسة غير مسجلة الدخول أو انتهت — أنشئ TG_SESSION من جديد")
+                raise UserbotError("الجلسة غير مسجلة الدخول أو انتهت")
             self.client = client
             return client
         except BaseException:
@@ -86,9 +75,7 @@ class session:
             _lock.release()
 
 
-# ============================ أدوات ============================
 def parse_ref(ref: str):
-    """يرجع ('invite', hash) أو ('user', username) أو (None, None)"""
     ref = (ref or "").strip()
     m = re.search(r"(?:t\.me/\+|t\.me/joinchat/|tg://join\?invite=)([\w-]+)", ref)
     if m:
@@ -96,7 +83,7 @@ def parse_ref(ref: str):
     m = re.search(r"(?:t\.me/|telegram\.me/)([A-Za-z]\w{3,})", ref)
     if m and m.group(1) not in ("joinchat",):
         return "user", m.group(1)
-    m = re.fullmatch(r"@([A-Za-z]\w{3,})", ref)  # الاسم المجرد يتطلب @ حتى لا تُفسَّر أي كلمة كاسم مستخدم
+    m = re.fullmatch(r"@([A-Za-z]\w{3,})", ref)
     if m:
         return "user", m.group(1)
     return None, None
@@ -106,7 +93,7 @@ def peer_for(chat_id: int, access_hash):
     real_id, kind = utils.resolve_id(int(chat_id))
     if kind is PeerChannel:
         if not access_hash:
-            raise UserbotError("لا يوجد access_hash لهذا المصدر — اربط الحساب به من جديد")
+            raise UserbotError("لا يوجد access_hash لهذا المصدر")
         return InputPeerChannel(real_id, int(access_hash))
     if kind is PeerChat:
         return InputPeerChat(real_id)
@@ -143,7 +130,6 @@ def item_from_tl(m, chat_id: int):
     )
 
 
-# ============================ العمليات ============================
 async def check() -> str:
     async with session() as c:
         me = await c.get_me()
@@ -152,10 +138,9 @@ async def check() -> str:
 
 
 async def resolve_and_join(ref: str):
-    """ينضم للمصدر ويرجع (chat_id, title, username, access_hash)"""
     kind, val = parse_ref(ref)
     if not kind:
-        raise UserbotError("أرسل @username أو رابط القناة أو رابط دعوة (t.me/+…)")
+        raise UserbotError("أرسل @username أو رابط القناة أو رابط دعوة")
     async with session() as c:
         if kind == "invite":
             try:
@@ -170,7 +155,7 @@ async def resolve_and_join(ref: str):
             chat = await c.get_entity(val)
             try:
                 await c(JoinChannelRequest(chat))
-            except Exception as e:  # منضم مسبقاً أو مجموعة عادية
+            except Exception as e:
                 log.info("join skipped: %s", e)
         return (
             utils.get_peer_id(chat),
@@ -181,7 +166,6 @@ async def resolve_and_join(ref: str):
 
 
 async def fetch(chat_id: int, access_hash, min_id: int, on_batch, batch_size: int = 200) -> None:
-    """يجلب الرسائل الأحدث من min_id ويفهرسها دفعات عبر on_batch(list)"""
     async with session() as c:
         peer = peer_for(chat_id, access_hash)
         batch = []
@@ -206,3 +190,9 @@ async def download(chat_id: int, access_hash, msg_id: int) -> bytes:
         if not data:
             raise UserbotError("فشل تحميل الملف")
         return data
+
+# الميزة الجديدة: تحويل الرسالة مباشرة للمستخدم
+async def forward_to_user(chat_id: int, access_hash, msg_id: int, user_id: int):
+    async with session() as c:
+        peer = peer_for(chat_id, access_hash)
+        await c.forward_messages(user_id, msg_id, peer)
