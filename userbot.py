@@ -196,19 +196,6 @@ async def fetch(chat_id: int, access_hash, min_id: int, on_batch, batch_size: in
             on_batch(batch)
 
 
-async def forward_to(dest_id: int, from_chat_id: int, access_hash, msg_id: int) -> int:
-    """
-    يحوّل (forward) رسالة من المصدر إلى مجموعة التحويل عبر الحساب.
-    يرجع message_id داخل مجموعة التحويل. البوت (مشرف هناك) ينسخها منها للمستخدم.
-    """
-    async with session() as c:
-        from_peer = peer_for(from_chat_id, access_hash)
-        dest = await c.get_entity(int(dest_id))
-        res = await c.forward_messages(dest, int(msg_id), from_peer)
-        m = res[0] if isinstance(res, (list, tuple)) else res
-        return m.id
-
-
 async def download(chat_id: int, access_hash, msg_id: int) -> bytes:
     async with session() as c:
         peer = peer_for(chat_id, access_hash)
@@ -219,3 +206,46 @@ async def download(chat_id: int, access_hash, msg_id: int) -> bytes:
         if not data:
             raise UserbotError("فشل تحميل الملف")
         return data
+
+
+# ============================ مجموعة التحويل ============================
+_relay_peer = {}
+
+
+async def _relay_entity(c, relay_id: int):
+    if relay_id in _relay_peer:
+        return _relay_peer[relay_id]
+    try:
+        ent = await c.get_input_entity(int(relay_id))
+    except ValueError:
+        await c.get_dialogs(limit=300)  # الجلسة لا تحفظ الكيانات: نحمّل المحادثات مرة
+        try:
+            ent = await c.get_input_entity(int(relay_id))
+        except ValueError:
+            raise UserbotError("الحساب ليس عضواً في مجموعة التحويل")
+    _relay_peer[relay_id] = ent
+    return ent
+
+
+async def forward_to_relay(chat_id: int, access_hash, msg_ids: list, relay_id: int) -> list:
+    """يحوّل الرسائل دفعة واحدة إلى المجموعة، ويرجع أرقامها الجديدة (None للفاشل)"""
+    async with session() as c:
+        peer = peer_for(chat_id, access_hash)
+        dest = await _relay_entity(c, relay_id)
+        res = await c.forward_messages(dest, list(msg_ids), from_peer=peer)
+        if not isinstance(res, list):
+            res = [res]
+        return [getattr(m, "id", None) if m else None for m in res]
+
+
+async def check_relay(relay_id: int) -> str:
+    async with session() as c:
+        ent = await c.get_entity(await _relay_entity(c, relay_id))
+        return utils.get_display_name(ent)
+
+
+async def send_test(relay_id: int) -> int:
+    """يرسل الحساب رسالة تجربة؛ يرجع رقمها ليحذفها البوت (يثبت أن البوت يصل لرسائل الحساب)"""
+    async with session() as c:
+        m = await c.send_message(await _relay_entity(c, relay_id), "🧪 فحص اتصال")
+        return m.id
