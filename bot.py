@@ -49,6 +49,7 @@ from telegram.ext import (
 import library
 import ai
 import userbot
+import usernames
 
 # ============================ الإعدادات ============================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
@@ -282,12 +283,13 @@ def home_view():
         f"👥 المجموعات المقبولة: {sum(1 for g in DB['groups'].values() if g.get('status') == 'ok')}\n"
         f"📡 تيليجرام: {'🧪 التجريبي' if IS_TEST_ENV else 'العادي'}\n"
         f"👥 المستخدمون: {len(DB['users'])}\n\n"
-        "💡 للتجربة كمستخدم: /mode"
+        "💡 للتجربة كمستخدم: /mode · فحص مفاتيح Gemini/Grok: /aitest"
     )
     markup = kb(
         [b("➕ إضافة مود جديد", "add", "success")],
         [b("📋 إدارة المودات", "list", "primary")],
         [b("📚 إدارة المكتبة", "la", "primary")],
+        [b("🔎 صيد اليوزرات (4-5 أحرف)", "un", "primary")],
         [
             b("⏸ إيقاف البوت", "togglebot", "danger")
             if DB["enabled"]
@@ -1352,6 +1354,18 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await m.edit_text(await connection_report(context.bot))
 
 
+async def cmd_aitest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """فحص مفاتيح Gemini و Grok والموديلات المتاحة (للأدمن)"""
+    if not is_admin(update.effective_user.id):
+        return
+    m = await update.message.reply_text("⏳ جاري فحص مفاتيح Gemini و Grok…")
+    try:
+        report = await ai.diagnose()
+    except Exception as e:  # noqa: BLE001
+        report = f"❌ {type(e).__name__}: {e}"
+    await m.edit_text(report[:4000])
+
+
 async def cmd_setrelay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -1423,6 +1437,10 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE,
     st = context.user_data["state"]
     step = st["step"]
     reply = update.message.reply_text
+
+    if step in ("un_pat", "un_mine"):
+        await un_handle_input(update, context, text)
+        return
 
     if step == "imglim":
         if not text.isdigit():
@@ -1499,6 +1517,214 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE,
             await reply(report, reply_markup=kb([b("📂 المصادر", "lasrc", "primary")], [b("📚 المكتبة", "la")]))
         else:
             await reply(report, reply_markup=CANCEL_KB)
+
+
+# ============================ 🔎 صيد اليوزرات (4-5 أحرف) ============================
+HUNT = {"running": False, "stop": False}
+UN_CMDS = {"un", "unl", "unmax", "unm", "unstop", "unlast"}
+
+
+def un_cfg() -> dict:
+    c = DB.setdefault("un", {})
+    c.setdefault("len", "45")
+    c.setdefault("max", 300)
+    c.setdefault("found", {"free": [], "fragment": [], "ts": 0})
+    c["found"].setdefault("all", [])
+    c.setdefault("cooldown", 0)
+    return c
+
+
+def un_view(notice: str = ""):
+    c = un_cfg()
+    ln = {"4": "4 أحرف", "5": "5 أحرف", "45": "4 + 5"}.get(c["len"], "4 + 5")
+    acct = "✅ مُهيّأ" if usernames.configured() else f"⚪ غير مُهيّأ — {usernames.why_not()}"
+    text = (notice + "\n\n" if notice else "") + (
+        "🔎 صيد اليوزرات القصيرة\n\n"
+        f"👤 الحساب: {acct}\n"
+        f"📏 الطول: {ln}\n"
+        f"🎯 عدد الأسماء في كل جولة: {c['max']} (≈ {max(1, round(c['max'] * 2.05 / 60))} دقيقة)\n\n"
+        "✅ متاح للتسجيل · 💎 معروض للشراء على Fragment · ⛔ مأخوذ/محجوز\n"
+        "ℹ️ يوزرات 4 أحرف غالباً مأخوذة أو معروضة على Fragment ولا تُسجَّل مباشرة."
+    )
+    if HUNT["running"]:
+        text += "\n\n⏳ يوجد فحص يعمل الآن."
+        return text, kb([b("⏹ إيقاف الفحص", "unstop", "danger")], [b("⬅️ رجوع", "home")])
+    rows = [
+        [b(("✅ " if c["len"] == v else "") + t, f"unl:{v}", "success" if c["len"] == v else "primary")
+         for v, t in (("4", "4 أحرف"), ("5", "5 أحرف"), ("45", "4 + 5"))],
+        [b(("✅ " if c["max"] == v else "") + f"{v} اسم", f"unmax:{v}", "success" if c["max"] == v else None)
+         for v in (100, 300, 1000)],
+        [b("🔁 تكرار وأنماط جميلة", "unm:rep", "success")],
+        [b("🔣 بشرطة _ مثل rq_54", "unm:us", "success")],
+        [b("🗣 أسماء سهلة النطق", "unm:cv", "success"), b("📖 كلمات جاهزة", "unm:words", "success")],
+        [b("✏️ نمط مخصص (ab??)", "unm:pat", "primary"), b("📝 قائمة أرسلها", "unm:mine", "primary")],
+        [b("📋 آخر النتائج", "unlast"), b("🏠 الرئيسية", "home")],
+    ]
+    return text, kb(*rows)
+
+
+async def un_send_results(bot, chat_id: int, free: list, frag: list) -> None:
+    from telegram import LinkPreviewOptions
+
+    for part in usernames.format_results(free, frag):
+        await bot.send_message(chat_id, part, parse_mode="HTML",
+                               link_preview_options=LinkPreviewOptions(is_disabled=True))
+
+
+async def un_send_files(bot, chat_id: int, free: list, frag: list, allc: list) -> None:
+    """يرسل ملفات txt: المتاح (مع روابط Fragment) + كل ما فُحص"""
+    import io
+
+    for fname, text, cap in usernames.report_files(free, frag, allc):
+        await bot.send_document(chat_id, document=io.BytesIO(text.encode("utf-8-sig")), filename=fname, caption=cap)
+
+
+async def un_run(bot, chat_id: int, mode: str, payload) -> None:
+    """جولة صيد كاملة (تعمل في الخلفية). المتصل يضبط HUNT['running']=True قبل الاستدعاء."""
+    c = un_cfg()
+    try:
+        lengths = {4, 5} if c["len"] == "45" else {int(c["len"])}
+        try:
+            names = await asyncio.to_thread(usernames.build, mode, lengths, c["max"], payload)
+        except ValueError as e:
+            await bot.send_message(chat_id, f"⚠️ {e}")
+            return
+        if not names:
+            await bot.send_message(chat_id, "📭 لا توجد أسماء جديدة بهذا النمط (كلها فُحصت حديثاً). جرّب نمطاً آخر.")
+            return
+
+        est = max(1, round(len(names) * 2.05 / 60))
+        stop_kb = kb([b("⏹ إيقاف الفحص", "unstop", "danger")])
+        msg = await bot.send_message(chat_id, f"⏳ بدأ فحص {len(names)} اسماً (≈ {est} دقيقة)…", reply_markup=stop_kb)
+        last = [0.0]
+
+        async def progress(res, total):
+            if time.time() - last[0] < 6:
+                return
+            last[0] = time.time()
+            try:
+                await msg.edit_text(
+                    f"🔎 {res['checked']}/{total}\n"
+                    f"✅ متاح: {len(res['free'])} · 💎 Fragment: {len(res['fragment'])} · "
+                    f"⛔ غير متاح: {res['taken'] + res['invalid']}",
+                    reply_markup=stop_kb,
+                )
+            except TelegramError:
+                pass
+
+        res = await usernames.hunt(names, progress, lambda: HUNT["stop"])
+
+        f = c["found"]
+        f["free"] = list(dict.fromkeys(res["free"] + f["free"]))[:5000]
+        f["fragment"] = list(dict.fromkeys(res["fragment"] + f["fragment"]))[:5000]
+        f["all"] = res["all"][:5000]  # كل ما فُحص في آخر جولة
+        f["ts"] = int(time.time())
+        if res["flood"]:
+            c["cooldown"] = int(time.time()) + res["flood"] + 5
+        save_data()
+
+        head = (f"{'⏹ أُوقف الفحص' if HUNT['stop'] else '✅ انتهى الفحص'}: {res['checked']} اسم · "
+                f"⛔ {res['taken'] + res['invalid']} غير متاح")
+        if res["flood"]:
+            head += f"\n⏳ طلب تيليجرام الانتظار {res['flood']} ثانية — توقفت الجولة تلقائياً."
+        if res["aborted"]:
+            head += f"\n❌ {res['aborted']}"
+        await bot.send_message(chat_id, head, reply_markup=kb([b("🔎 جولة جديدة", "un", "primary")], [b("🏠 الرئيسية", "home")]))
+        if res["free"] or res["fragment"]:
+            await un_send_results(bot, chat_id, res["free"], res["fragment"])
+        else:
+            await bot.send_message(chat_id, "😕 لم أجد متاحاً في هذه الجولة. جرّب نمطاً آخر أو جولة جديدة.")
+        await un_send_files(bot, chat_id, res["free"], res["fragment"], res["all"])
+    except Exception as e:  # noqa: BLE001
+        log.exception("un_run failed")
+        try:
+            await bot.send_message(chat_id, f"❌ {type(e).__name__}: {e}")
+        except TelegramError:
+            pass
+    finally:
+        HUNT["running"] = False
+        HUNT["stop"] = False
+
+
+async def un_button(q, context, cmd: str, arg: str, admin_chat: int) -> None:
+    c = un_cfg()
+    bot = context.bot
+
+    if cmd == "un":
+        context.user_data.pop("state", None)
+        await edit(q, *un_view())
+
+    elif cmd == "unl":
+        c["len"] = arg if arg in ("4", "5", "45") else "45"
+        save_data()
+        await edit(q, *un_view())
+
+    elif cmd == "unmax":
+        c["max"] = int(arg) if arg in ("100", "300", "1000") else 300
+        save_data()
+        await edit(q, *un_view())
+
+    elif cmd == "unstop":
+        HUNT["stop"] = True
+        await edit(q, *un_view("⏹ سيتوقف الفحص بعد الاسم الحالي."))
+
+    elif cmd == "unlast":
+        f = c["found"]
+        if not (f["free"] or f["fragment"] or f["all"]):
+            await bot.send_message(admin_chat, "📭 لا توجد نتائج محفوظة بعد.")
+            return
+        if f["free"] or f["fragment"]:
+            await un_send_results(bot, admin_chat, f["free"], f["fragment"])
+        await un_send_files(bot, admin_chat, f["free"], f["fragment"], f["all"])
+
+    elif cmd == "unm":
+        if HUNT["running"]:
+            await bot.send_message(admin_chat, "⚠️ يوجد فحص يعمل الآن، أوقفه أولاً.")
+            return
+        if not usernames.configured():
+            await bot.send_message(admin_chat, f"⚠️ يلزم ربط حساب (Session): {usernames.why_not()}")
+            return
+        wait = int(c["cooldown"] - time.time())
+        if wait > 0:
+            await bot.send_message(admin_chat, f"⏳ تيليجرام طلب الانتظار — جرّب بعد {math.ceil(wait / 60)} دقيقة.")
+            return
+        if arg == "pat":
+            context.user_data["state"] = {"step": "un_pat"}
+            await edit(
+                q,
+                "✏️ أرسل النمط (4 أو 5 رموز):\n"
+                "الرموز: ? = أي حرف ، # = أي رقم\n\n"
+                "أمثلة:\n• ab?? ← كل ما يبدأ بـ ab\n• ?a?e? ← حروف ثابتة في أماكنها\n"
+                "• rq_## ← rq_00 حتى rq_99 (بشرطة سفلية)\n• ??_## ← مثل rq_54\n• zz## ← حرفان ثم رقمان",
+                CANCEL_KB,
+            )
+        elif arg == "mine":
+            context.user_data["state"] = {"step": "un_mine"}
+            await edit(q, "📝 أرسل الأسماء (4 أو 5 أحرف) مفصولة بمسافة أو سطر جديد أو فاصلة:", CANCEL_KB)
+        elif arg in ("rep", "us", "cv", "words"):
+            HUNT.update(running=True, stop=False)
+            spawn(un_run(bot, admin_chat, arg, None))
+            await edit(q, *un_view("⏳ بدأ الفحص — سأرسل التقدم والنتائج هنا."))
+
+
+async def un_handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    st = context.user_data["state"]
+    mode = "pat" if st["step"] == "un_pat" else "mine"
+    reply = update.message.reply_text
+    if mode == "pat" and not usernames.parse_pattern(text):
+        await reply("⚠️ نمط غير صالح. أرسل 4 أو 5 رموز، مثال: ab?? أو rq_## أو ?a?e?", reply_markup=CANCEL_KB)
+        return
+    if mode == "mine" and not any(usernames.valid(w, {4, 5}) for w in usernames.parse_list(text)):
+        await reply("⚠️ لم أجد أسماء صالحة. أرسل أسماء من 4 أو 5 أحرف (a-z و 0-9) مفصولة بمسافة أو سطر.",
+                    reply_markup=CANCEL_KB)
+        return
+    if HUNT["running"]:
+        await reply("⚠️ يوجد فحص يعمل الآن، أوقفه أولاً.")
+        return
+    context.user_data.pop("state", None)
+    HUNT.update(running=True, stop=False)
+    spawn(un_run(context.bot, update.effective_chat.id, mode, text))
+    await reply("⏳ جاري التجهيز…")
 
 
 # ============================ الأزرار ============================
@@ -1670,6 +1896,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif cmd == "list":
         context.user_data.pop("state", None)
         await edit(q, *list_view())
+
+    elif cmd in UN_CMDS:
+        await un_button(q, context, cmd, arg, admin_chat)
 
     elif cmd == "togglebot":
         DB["enabled"] = not DB["enabled"]
@@ -1955,6 +2184,7 @@ def main():
     app.add_handler(CommandHandler("mode", cmd_mode))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("aitest", cmd_aitest))
     app.add_handler(CommandHandler("setrelay", cmd_setrelay))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
