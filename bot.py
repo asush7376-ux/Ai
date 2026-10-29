@@ -77,7 +77,19 @@ def start_health_server():
         def log_message(self, *args): pass
     server = HTTPServer(("0.0.0.0", int(port)), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-
+async def post_init(app: Application):
+    await app.bot.set_my_commands(
+        [
+            BotCommand("start", "بدء"),
+            BotCommand("mode", "تغيير المود"),
+            BotCommand("new", "محادثة جديدة"),
+            BotCommand("id", "معرفة رقمك"),
+            BotCommand("image", "تصميم صورة"),
+            BotCommand("status", "فحص اتصال الحساب والمجموعة (للأدمن)"),
+        ]
+    )
+    if LIB_SYNC_MINUTES > 0:
+        spawn(sync_loop(app))
 # ============================ التشغيل المعدل ============================
 def main():
     global IS_TEST_ENV
