@@ -31,7 +31,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import httpx
-from telegram import BotCommand
+from telegram import BotCommand, InputFile
 from telegram import InlineKeyboardButton as Btn
 from telegram import InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
@@ -901,7 +901,7 @@ async def send_text_item(bot, chat_id: int, it: dict) -> None:
 
 
 async def direct_copy(bot, chat_id: int, it: dict, src: dict):
-    """True=نجح، False=فشل، None=الرسالة حُذفت"""
+    """True=copied, False=unavailable, None=not found in this bot's network."""
     if not src.get("bot"):
         return False
     for _ in range(2):
@@ -927,49 +927,161 @@ async def send_link(bot, chat_id: int, it: dict, src: dict) -> bool:
     return False
 
 
-async def deliver_items(context, chat_id: int, rids: list) -> int:
-    """الترتيب: نص كامل / نسخ مباشر من البوت ← تحويل عبر الحساب للمجموعة ثم البوت ← رابط"""
-    bot = context.bot
-    items = [i for i in library.get_many(rids)]
-    ok, pending = 0, []
-    for it in items:
-        src = DB["lib"]["sources"].get(str(it["chat_id"]))
-        if not src:
-            continue
-        if it["kind"] == "text":
-            await send_text_item(bot, chat_id, it)
-            ok += 1
-            continue
-        r = await direct_copy(bot, chat_id, it, src)
-        if r is True:
-            ok += 1
-            await asyncio.sleep(0.3)
-        elif r is None:
-            library.delete_item(it["id"])
+# Library files are downloaded one at a time to bound memory use.
+LIB_UPLOAD_LOCK = asyncio.Lock()
+LIB_FILE_LIMIT = 49_000_000
+LIB_PHOTO_LIMIT = 9_500_000
+
+
+class LibraryDeliveryError(Exception):
+    pass
+
+
+def lib_delivery_view(it: dict, chat_id: int):
+    rid = it['id']
+    kind = it['kind']
+    label = library.KIND_AR.get(kind, 'وسائط')
+    icon = library.ICONS.get(kind, '📤')
+    rows = [[b(f'{icon} إرسال {label}', f'lsend:media:{rid}', 'primary'),
+             b('📎 إرسال كملف', f'lsend:file:{rid}')]]
+    src = DB['lib']['sources'].get(str(it['chat_id'])) or {}
+    if library.link_for(src, it):
+        rows.append([b('🔗 إرسال الرابط', f'lsend:link:{rid}')])
+    st = LIB_STATE.get(chat_id)
+    if st and len(st['ids']) > 1:
+        rows.append([b('🔎 الرجوع للنتائج', f"lpg:{st['page']}")])
+    rows.append([BACK_TO_CHAT])
+    text = f"📚 {library.label(it)}\n\nكيف تريد استلامه؟"
+    if kind != 'text':
+        text += '\nالوسائط تُرسل بنوعها الأصلي، أو اختر ملفاً للتنزيل.'
+    return text, kb(*rows)
+
+
+async def lib_choose_delivery(context, chat_id: int, ids: list):
+    for it in library.get_many(ids):
+        if str(it['chat_id']) in DB['lib']['sources']:
+            text, markup = lib_delivery_view(it, chat_id)
+            await context.bot.send_message(chat_id, text, reply_markup=markup)
+
+
+def lib_upload_filename(it: dict) -> str:
+    defaults = {'photo': '.jpg', 'video': '.mp4', 'animation': '.mp4',
+                'audio': '.mp3', 'voice': '.ogg', 'text': '.txt'}
+    ext = it.get('ext') or defaults.get(it['kind'], '.bin')
+    if not re.fullmatch(r'\.[a-zA-Z0-9]{1,8}', ext):
+        ext = defaults.get(it['kind'], '.bin')
+    name = (it.get('filename') or f"library-{it['id']}{ext}").replace('\\', '/')
+    name = name.rsplit('/', 1)[-1].replace('\r', '').replace('\n', '').replace('\x00', '')
+    return name[:180] or f"library-{it['id']}{ext}"
+
+
+async def lib_upload(context, chat_id: int, it: dict, src: dict, as_file: bool = False):
+    """Download through the source session, then upload using the destination bot.
+
+    This also works across Telegram production/Test because it transfers bytes,
+    never a file_id from a different environment. No format conversion is done.
+    """
+    kind = it['kind']
+    limit = LIB_PHOTO_LIMIT if kind == 'photo' and not as_file else LIB_FILE_LIMIT
+    async with LIB_UPLOAD_LOCK:
+        if kind == 'text':
+            data = (it.get('text') or it.get('caption') or it.get('name') or '').encode('utf-8')
         else:
-            pending.append(it)
-    if pending:
-        # على دفعات حتى لا يطول التحويل الواحد
-        for i in range(0, len(pending), 50):
-            part = pending[i:i + 50]
-            done = await relay_many(bot, chat_id, part)
-            for it in part:
-                if done.get(it["id"]):
-                    ok += 1
-                elif await send_link(bot, chat_id, it, DB["lib"]["sources"].get(str(it["chat_id"])) or {}):
-                    ok += 1
+            if not src.get('session') or not userbot.configured():
+                raise LibraryDeliveryError('إرسال الملف يحتاج جلسة حساب متصلة بهذا المصدر.')
+            if (it.get('size') or 0) > limit:
+                raise LibraryDeliveryError('حجم الملف أكبر من حد الرفع المتاح؛ اختر الرابط بدلاً منه.')
+            try:
+                data = await asyncio.wait_for(
+                    userbot.download(it['chat_id'], src.get('access_hash'), it['msg_id'], max_bytes=limit),
+                    timeout=180,
+                )
+            except asyncio.TimeoutError:
+                raise LibraryDeliveryError('انتهت مهلة تحميل الملف؛ جرّب لاحقاً أو اختر الرابط.')
+            except userbot.UserbotError as exc:
+                raise LibraryDeliveryError(str(exc))
+            except Exception as exc:
+                log.warning('Library download failed: %s', type(exc).__name__)
+                raise LibraryDeliveryError('تعذر تحميل الملف من المصدر؛ تحقق من صلاحية الجلسة والمصدر.')
+        if not data:
+            raise LibraryDeliveryError('الملف فارغ أو تعذر تحميله.')
+        if len(data) > limit:
+            raise LibraryDeliveryError('حجم الملف أكبر من حد الرفع المتاح؛ اختر الرابط بدلاً منه.')
+        media = InputFile(data, filename=lib_upload_filename(it))
+        caption = (it.get('caption') or it.get('name') or '')[:1000]
+        common = {'chat_id': chat_id, 'caption': caption, 'write_timeout': 180, 'read_timeout': 60}
+        bot = context.bot
+        if as_file or kind in ('document', 'text'):
+            await bot.send_document(document=media, disable_content_type_detection=True, **common)
+        elif kind == 'photo':
+            await bot.send_photo(photo=media, **common)
+        elif kind == 'video':
+            await bot.send_video(video=media, supports_streaming=True, **common)
+        elif kind == 'animation':
+            await bot.send_animation(animation=media, **common)
+        elif kind == 'audio':
+            await bot.send_audio(audio=media, **common)
+        elif kind == 'voice':
+            await bot.send_voice(voice=media, **common)
+        else:
+            raise LibraryDeliveryError('نوع الملف غير مدعوم؛ اختر إرساله كملف أو كرابط.')
+
+
+async def lib_deliver_choice(context, chat_id: int, it: dict, how: str) -> bool:
+    src = DB['lib']['sources'].get(str(it['chat_id']))
+    if not src:
+        raise LibraryDeliveryError('مصدر هذا العنصر لم يعد متاحاً.')
+    if how == 'link':
+        if not await send_link(context.bot, chat_id, it, src):
+            raise LibraryDeliveryError('لا يوجد رابط متاح لهذا العنصر.')
+        return True
+    if how == 'media' and it['kind'] == 'text':
+        await send_text_item(context.bot, chat_id, it)
+        return True
+    # Copying preserves the native format. File conversion requires a fresh upload.
+    if how == 'media' or it['kind'] == 'document':
+        # A Session source belongs to production Telegram, not the Test network.
+        if not (IS_TEST_ENV and src.get('session')):
+            if await direct_copy(context.bot, chat_id, it, src) is True:
+                return True
+        done = await relay_many(context.bot, chat_id, [it])
+        if done.get(it['id']):
+            return True
+    await lib_upload(context, chat_id, it, src, as_file=(how == 'file'))
+    return True
+
+
+async def deliver_items(context, chat_id: int, rids: list, how: str = 'media') -> int:
+    """Send the requested format. Never silently replace media with a link."""
+    ok = 0
+    for it in library.get_many(rids):
+        try:
+            await lib_deliver_choice(context, chat_id, it, how)
+            ok += 1
+        except (LibraryDeliveryError, TelegramError) as exc:
+            log.warning('Library delivery failed: %s', type(exc).__name__)
+            reason = str(exc) if isinstance(exc, LibraryDeliveryError) else 'رفض تيليجرام الإرسال أو انقطع الاتصال؛ اختر صيغة أخرى أو أعد المحاولة.'
+            _, markup = lib_delivery_view(it, chat_id)
+            await context.bot.send_message(chat_id, f'⚠️ {library.label(it)}\n{reason}', reply_markup=markup)
+        await asyncio.sleep(0.3)
     return ok
 
 
-async def deliver(context, chat_id: int, rid: int) -> bool:
-    return await deliver_items(context, chat_id, [rid]) > 0
+async def deliver(context, chat_id: int, rid: int, how: str = 'media') -> bool:
+    return await deliver_items(context, chat_id, [rid], how) > 0
 
 
-async def lib_send_many(context, chat_id: int, ids: list, total: int | None = None) -> None:
+async def lib_send_many(context, chat_id: int, ids: list, total: int | None = None, how: str = 'media') -> None:
     bot = context.bot
-    await bot.send_message(chat_id, f"📤 جاري إرسال {len(ids)} ملف…")
-    ok = await deliver_items(context, chat_id, ids)
-    await bot.send_message(chat_id, f"✅ تم إرسال {ok} من {len(ids)}.", reply_markup=lib_after_kb(chat_id))
+    await bot.send_message(chat_id, f'📤 جاري إرسال {len(ids)} عنصراً…')
+    ok = await deliver_items(context, chat_id, ids, how)
+    await bot.send_message(chat_id, f'✅ تم إرسال {ok} من {len(ids)}.', reply_markup=lib_after_kb(chat_id))
+
+
+def lib_batch_view():
+    return '📚 كيف تريد استلام جميع النتائج؟', kb(
+        [b('📤 بالنوع الأصلي', 'lbatch:media', 'primary'), b('📎 كملفات', 'lbatch:file')],
+        [b('🔗 روابط فقط', 'lbatch:link')], [BACK_TO_CHAT])
 
 
 async def lib_handle(context, chat_id: int, admin: bool, text: str) -> None:
@@ -989,10 +1101,11 @@ async def lib_handle(context, chat_id: int, admin: bool, text: str) -> None:
         if not nums:
             await bot.send_message(chat_id, f"⚠️ اختر رقماً من 1 إلى {len(st['ids'])}.")
             return
-        await lib_send_many(context, chat_id, [st["ids"][n - 1] for n in nums])
+        await lib_choose_delivery(context, chat_id, [st["ids"][n - 1] for n in nums])
         return
     if st and intent == "send_all":
-        await lib_send_many(context, chat_id, st["ids"])
+        t, m = lib_batch_view()
+        await bot.send_message(chat_id, t, reply_markup=m)
         return
     if st and intent == "more":
         t, m = lib_list_view(chat_id, st["page"] + 1)
@@ -1010,11 +1123,8 @@ async def lib_handle(context, chat_id: int, admin: bool, text: str) -> None:
 
     n = len(rows)
     if n == 1:
-        await bot.send_message(chat_id, f"✅ وجدت ملفاً واحداً:\n{library.label(rows[0])}\n⏳ جاري الإرسال…")
-        ok = await deliver(context, chat_id, rows[0]["id"])
-        await bot.send_message(
-            chat_id, "✅ تم الإرسال." if ok else "⚠️ تعذر إرسال الملف.", reply_markup=back
-        )
+        LIB_STATE.pop(chat_id, None)
+        await lib_choose_delivery(context, chat_id, [rows[0]['id']])
         return
 
     LIB_STATE[chat_id] = {
@@ -1747,7 +1857,7 @@ async def un_handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE, te
 
 # ============================ الأزرار ============================
 USER_CMDS = {"chg", "pick", "smart", "newchat", "closepick", "lib", "libp", "lp", "lpg", "lall",
-             "prov", "setprov", "img"}
+             "prov", "setprov", "img", "lsend", "lbatch"}
 
 
 async def on_user_button(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str, arg: str):
@@ -1863,27 +1973,37 @@ async def on_user_button(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
         else:
             await context.bot.send_message(chat_id, lib_intro_text(), reply_markup=markup)
 
-    elif cmd in ("lp", "lpg", "lall"):
-        if not lib_available(admin):
-            await q.answer("المكتبة غير متاحة حالياً", show_alert=True)
+    elif cmd in ('lp', 'lpg', 'lall', 'lsend', 'lbatch'):
+        if (not DB['enabled'] and not admin) or not lib_available(admin):
+            await q.answer('المكتبة غير متاحة حالياً', show_alert=True)
             return
-        if cmd == "lp":
-            if not arg.isdigit():
+        if cmd in ('lp', 'lsend'):
+            how, sep, value = arg.partition(':') if cmd == 'lsend' else ('media', ':', arg)
+            if not sep or how not in ('media', 'file', 'link') or not value.isdigit():
                 await q.answer()
                 return
-            await q.answer("⏳ جاري الإرسال…")
-            if not await deliver(context, chat_id, int(arg)):
-                await context.bot.send_message(chat_id, "⚠️ تعذر إرسال هذا الملف (قد يكون حُذف).")
+            it = library.get(int(value))
+            if not it or str(it['chat_id']) not in DB['lib']['sources']:
+                await q.answer('العنصر لم يعد متاحاً، ابحث من جديد', show_alert=True)
+                return
+            if cmd == 'lp':
+                await q.answer()
+                await edit(q, *lib_delivery_view(it, chat_id))
+            else:
+                await q.answer('⏳ جاري الإرسال…')
+                await deliver(context, chat_id, it['id'], how)
             return
         st = LIB_STATE.get(chat_id)
-        if not st:
-            await q.answer("انتهت صلاحية القائمة، ابحث من جديد", show_alert=True)
+        if not st or time.time() - st['ts'] > 3600:
+            await q.answer('انتهت صلاحية القائمة، ابحث من جديد', show_alert=True)
             return
         await q.answer()
-        if cmd == "lpg":
-            await edit(q, *lib_list_view(chat_id, int(arg) if arg.lstrip("-").isdigit() else 0))
-        else:
-            await lib_send_many(context, chat_id, st["ids"])
+        if cmd == 'lpg':
+            await edit(q, *lib_list_view(chat_id, int(arg) if arg.lstrip('-').isdigit() else 0))
+        elif cmd == 'lall':
+            await edit(q, *lib_batch_view())
+        elif arg in ('media', 'file', 'link'):
+            await lib_send_many(context, chat_id, list(st['ids']), how=arg)
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2229,7 +2349,7 @@ def main():
     if IS_TEST_ENV:
         log.warning(
             "🧪 وضع تيليجرام التجريبي: البوت في شبكة منفصلة عن تيليجرام العادي. حساب Session (Telethon) يبقى على "
-            "العادي، لذا تُعطَّل مجموعة التحويل، ولا يرى البوت قنوات/مجموعات تيليجرام العادي (المكتبة تُرسل روابط فقط)."
+            "العادي، لذا تُعطَّل مجموعة التحويل. ملفات المكتبة تُحمَّل عبر الجلسة ثم تُرفع للبوت عند اختيار الوسائط أو الملف، ضمن حدود الحجم والحماية."
         )
     app = build_app()
     # الفهرسة تعمل في مجموعة مستقلة (-1) فلا تعطّل بقية المعالجات
