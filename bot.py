@@ -64,7 +64,6 @@ RELAY_CHAT_ID = os.environ.get("RELAY_CHAT_ID", "").strip()  # مجموعة ال
 LIB_SYNC_MINUTES = int(os.environ.get("LIB_SYNC_MINUTES", "60"))
 LIB_PAGE = 8
 IS_TEST_ENV = False  # يُحدَّد تلقائياً عند التشغيل (تيليجرام التجريبي)
-MAX_RELAY_BYTES = 49 * 1024 * 1024  # حد رفع البوت عبر Bot API
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -282,7 +281,7 @@ def home_view():
         f"🎨 حد الصور اليومي: {DB['img_limit'] or 'بلا حد'}\n"
         f"👥 المجموعات المقبولة: {sum(1 for g in DB['groups'].values() if g.get('status') == 'ok')}\n"
         f"📡 تيليجرام: {'🧪 التجريبي' if IS_TEST_ENV else 'العادي'}\n"
-        f"👥 المستخدمون: {len(DB['users'])}\n\n"
+        f"👥 المستخدمون: {sum(1 for k in DB['users'] if not k.startswith('-'))}\n\n"
         "💡 للتجربة كمستخدم: /mode · فحص مفاتيح Gemini/Grok: /aitest"
     )
     markup = kb(
@@ -589,12 +588,12 @@ async def make_and_send_image(context, chat_id: int, uid: int, prompt: str, repl
         log.error("image error: %s", e)
         await wait.edit_text(f"❌ {e}" if is_admin(uid) else "⚠️ تعذّر تصميم الصورة، جرّب وصفاً آخر أو لاحقاً.")
         return
-    img_quota_use(uid)
     cap = f"🎨 {prompt[:900]}\n— {ai.NAMES[used]}"
     if used != provider:
         cap += f" (لأن {ai.NAMES[provider]} غير متاح)"
     await bot.send_photo(chat_id, data, caption=cap, reply_to_message_id=reply_to,
                          reply_markup=None if group else reply_kb(chat_id))
+    img_quota_use(uid)  # تُخصم الحصة بعد نجاح الإرسال فقط
     try:
         await wait.delete()
     except TelegramError:
@@ -657,8 +656,8 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text
     elif cmd == "صمم":
         await make_and_send_image(context, chat.id, uid, rest, msg.message_id, group=True)
     elif cmd == "ابحث":
-        if not DB["lib"]["sources"] or not (DB["lib"]["visible"] or is_admin(uid)):
-            await msg.reply_text("⚠️ المكتبة غير متاحة حالياً.")
+        if not DB["lib"]["sources"]:
+            await msg.reply_text("⚠️ المكتبة غير متاحة حالياً (لا توجد مصادر).")
         elif not rest:
             await msg.reply_text("✏️ اكتب: ابحث <الكلمة أو الجملة>")
         else:
@@ -762,6 +761,8 @@ def group_view(cid: str):
 # ============================ 📚 المكتبة: فهم الطلب (بدون إضافة كلمات) ============================
 _SEND_ALL = {"الكل", "ارسل الكل", "كلها", "ارسلها كلها", "ارسل كل النتايج", "الجميع", "all"}
 _MORE = {"المزيد", "التالي", "اكثر", "more", "next"}
+_ORDINALS = {"الاول": 1, "الثاني": 2, "الثالث": 3, "الرابع": 4, "الخامس": 5,
+             "السادس": 6, "السابع": 7, "الثامن": 8, "التاسع": 9, "العاشر": 10}
 
 
 def lib_understand(text: str, st) -> dict:
@@ -769,8 +770,11 @@ def lib_understand(text: str, st) -> dict:
     n = library.normalize(text)
     plan = {"intent": "search", "query": text.strip()[:60], "numbers": []}
     if st:
-        nums = re.findall(r"\d{1,4}", n)
-        if nums and re.fullmatch(r"[\d\s,و]+", n.replace("ارسل", "").strip() or "x"):
+        sel = n.replace("ارسل", " ")
+        for w, k in _ORDINALS.items():  # «أرسل الثالث» = «أرسل 3»
+            sel = re.sub(rf"\b{w}\b", str(k), sel)
+        nums = re.findall(r"\d{1,4}", sel)
+        if nums and re.fullmatch(r"[\d\s,و]+", sel.strip() or "x"):
             plan.update(intent="select", numbers=[int(x) for x in nums])
             return plan
         if n in _SEND_ALL:
@@ -814,7 +818,7 @@ def lib_list_view(chat_id: int, page: int):
         f"🔎 وجدت {n} نتيجة عن «{st['query']}»\n{st['summary']}\n\n"
         + "\n".join(lines)
         + f"\n\n📄 صفحة {page + 1}/{pages}\n"
-        "اختر رقماً من الأزرار، أو اكتب مثل: «أرسل الثالث» / «أرسل الكل»"
+        "اختر رقماً من الأزرار، أو اكتب مثل: «أرسل 3» أو «أرسل الثالث» / «أرسل الكل»"
     )
     rows = [num_btns[i:i + 4] for i in range(0, len(num_btns), 4)]
     nav = []
@@ -1277,7 +1281,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if is_admin(uid):
+    if is_admin(uid) and update.effective_chat.type == "private":
         text, markup = home_view()
         await update.message.reply_text(text, reply_markup=markup)
         return
@@ -1419,6 +1423,18 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if is_admin(user.id) and chat.type == "private" and context.user_data.get("state"):
         await handle_admin_input(update, context, text)
+        return
+
+    # بحث مباشر في المكتبة بدون مغادرة المود: «ابحث <كلمة>»
+    if _norm_word(text.partition(" ")[0]) == "ابحث":
+        q = text.partition(" ")[2].strip()
+        if not q:
+            await update.message.reply_text("✏️ اكتب: ابحث <الكلمة أو الجملة>")
+        elif not lib_available(is_admin(user.id)):
+            await update.message.reply_text("⚠️ المكتبة غير متاحة حالياً.")
+        else:
+            LIB_STATE.pop(chat.id, None)
+            await lib_handle(context, chat.id, is_admin(user.id), q)
         return
 
     await respond(context, chat.id, user.id, text)
@@ -1832,6 +1848,13 @@ async def on_user_button(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
         save_data()
         LIB_STATE.pop(chat_id, None)
         await q.answer()
+        pending = context.user_data.pop("pending", None)
+        if pending:  # الرسالة التي كتبها قبل اختيار المكتبة: ابحث بها فوراً
+            await context.bot.send_message(
+                chat_id, f"📚 {DB['lib']['name']} — 🔎 أبحث عن: {pending[:60]}",
+                reply_markup=kb([BACK_TO_CHAT]))
+            await lib_handle(context, chat_id, admin, pending)
+            return
         markup = kb([BACK_TO_CHAT])
         if cmd == "libp":
             await edit(q, lib_intro_text(), markup)
