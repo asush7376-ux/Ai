@@ -196,15 +196,29 @@ async def fetch(chat_id: int, access_hash, min_id: int, on_batch, batch_size: in
             on_batch(batch)
 
 
-async def download(chat_id: int, access_hash, msg_id: int) -> bytes:
+async def download(chat_id: int, access_hash, msg_id: int, max_bytes: int = 49_000_000) -> bytes:
+    """Bound downloads and honor source protection before transferring any bytes."""
     async with session() as c:
         peer = peer_for(chat_id, access_hash)
         m = await c.get_messages(peer, ids=msg_id)
         if not m or not m.media:
-            raise UserbotError("الرسالة غير موجودة أو بلا ملف")
-        data = await c.download_media(m, file=bytes)
+            raise UserbotError('الرسالة غير موجودة أو بلا ملف')
+        chat = await m.get_chat()
+        if getattr(m, 'noforwards', False) or getattr(chat, 'noforwards', False):
+            raise UserbotError('المصدر يمنع حفظ المحتوى أو إعادة إرساله؛ استخدم الرابط.')
+        size = getattr(getattr(m, 'file', None), 'size', None) or 0
+        if size > max_bytes:
+            raise UserbotError('حجم الملف أكبر من حد الرفع المتاح؛ استخدم الرابط.')
+
+        def check_size(current, total):
+            if current > max_bytes or (total and total > max_bytes):
+                raise UserbotError('حجم الملف أكبر من حد الرفع المتاح؛ استخدم الرابط.')
+
+        data = await c.download_media(m, file=bytes, progress_callback=check_size)
         if not data:
-            raise UserbotError("فشل تحميل الملف")
+            raise UserbotError('فشل تحميل الملف')
+        if len(data) > max_bytes:
+            raise UserbotError('حجم الملف أكبر من حد الرفع المتاح؛ استخدم الرابط.')
         return data
 
 
