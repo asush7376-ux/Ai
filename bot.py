@@ -124,8 +124,7 @@ def spawn(coro):
 
 
 def relay_chat_id():
-    if IS_TEST_ENV:
-        return None  # الحساب على تيليجرام العادي فلا يمكنه التحويل لبوت تجريبي
+    # يُقرأ من /setrelay (أو زر الاعتماد) ثم من متغير البيئة RELAY_CHAT_ID الذي يبقى بعد إعادة النشر
     v = DB["lib"].get("relay") or RELAY_CHAT_ID
     return int(v) if str(v).lstrip("-").isdigit() else None
 
@@ -850,7 +849,9 @@ async def relay_many(bot, chat_id: int, items: list) -> dict:
     """الحساب يحوّل الرسائل لمجموعة التحويل ثم البوت ينسخها للمستخدم. يرجع {rid: True}"""
     done = {}
     relay = relay_chat_id()
-    if not relay or not userbot.configured() or not items:
+    # في الوضع التجريبي حساب Session على تيليجرام العادي ولا يصل لمجموعة تحويل تجريبية؛
+    # يُستخدم مسار التنزيل المباشر للوسائط بدلاً من التحويل
+    if IS_TEST_ENV or not relay or not userbot.configured() or not items:
         return done
     cache = DB["lib"].setdefault("relay_cache", {})
     need = {}
@@ -1117,7 +1118,7 @@ async def lib_handle(context, chat_id: int, admin: bool, text: str) -> None:
     query = plan["query"]
     if not rows:
         await bot.send_message(
-            chat_id, f"😕 لم أجد شيئاً عن «{query}» في {DB['lib']['name']}.\nجرّب كلمات أخرى.", reply_markup=back
+            chat_id, f"😕 لم أجد شيئاً عن «{query}».\nجرّب كلمات أخرى.", reply_markup=back
         )
         return
 
@@ -1306,12 +1307,15 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if chat.id == relay_chat_id():
             return
+        rows = [[b("✅ اعتماده", f"lsrc:{cid}", "success"), b("❌ تجاهل", "lskip", "danger")]]
+        if not relay_chat_id():
+            rows.append([b("🔁 اعتمادها مجموعة تحويل", f"lrel:{cid}", "primary")])
         for aid in ADMIN_IDS:
             try:
                 await context.bot.send_message(
                     aid,
                     f"🤖 تمت إضافتي إلى «{chat.title}».\nهل تريد اعتماده كمصدر للمكتبة؟",
-                    reply_markup=kb([b("✅ اعتماده", f"lsrc:{cid}", "success"), b("❌ تجاهل", "lskip", "danger")]),
+                    reply_markup=kb(*rows),
                 )
             except TelegramError:
                 pass
@@ -1446,6 +1450,9 @@ async def connection_report(bot) -> str:
         lines.append(f"🤖 البوت في المجموعة «{chat.title}»: {'✅ ' + mem.status if bot_ok else '❌ ' + mem.status}")
     except Exception as e:
         lines.append(f"🤖 البوت في المجموعة: ❌ {e}")
+    if IS_TEST_ENV:
+        lines.append("🧪 الوضع التجريبي: التحويل عبر الحساب غير متاح بين الشبكتين؛ تُرسل الوسائط بالتنزيل المباشر.")
+        return "\n".join(lines)
     if acc_ok:
         try:
             title = await userbot.check_relay(relay)
@@ -1963,7 +1970,7 @@ async def on_user_button(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
         pending = context.user_data.pop("pending", None)
         if pending:  # الرسالة التي كتبها قبل اختيار المكتبة: ابحث بها فوراً
             await context.bot.send_message(
-                chat_id, f"📚 {DB['lib']['name']} — 🔎 أبحث عن: {pending[:60]}",
+                chat_id, f"🔎 أبحث عن: {pending[:60]}",
                 reply_markup=kb([BACK_TO_CHAT]))
             await lib_handle(context, chat_id, admin, pending)
             return
@@ -2178,6 +2185,15 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif cmd == "lskip":
         await edit(q, "تم التجاهل.")
 
+    elif cmd == "lrel":
+        if not arg.lstrip("-").isdigit():
+            await edit(q, "⚠️ أيدي غير صالح.")
+            return
+        DB["lib"]["relay"] = arg
+        DB["lib"]["relay_cache"] = {}
+        save_data()
+        await edit(q, f"✅ مجموعة التحويل: {arg}\nافحص الاتصال: /status")
+
     # ---------- إدارة المودات ----------
     elif cmd in ("m", "vis", "def", "en", "ep", "show", "del", "delok"):
         if arg not in DB["modes"]:
@@ -2349,7 +2365,7 @@ def main():
     if IS_TEST_ENV:
         log.warning(
             "🧪 وضع تيليجرام التجريبي: البوت في شبكة منفصلة عن تيليجرام العادي. حساب Session (Telethon) يبقى على "
-            "العادي، لذا تُعطَّل مجموعة التحويل. ملفات المكتبة تُحمَّل عبر الجلسة ثم تُرفع للبوت عند اختيار الوسائط أو الملف، ضمن حدود الحجم والحماية."
+            "العادي، لذا لا يصل لمجموعة التحويل التجريبية ويُعتمد التنزيل المباشر. ملفات المكتبة تُحمَّل عبر الجلسة ثم تُرفع للبوت عند اختيار الوسائط أو الملف، ضمن حدود الحجم والحماية."
         )
     app = build_app()
     # الفهرسة تعمل في مجموعة مستقلة (-1) فلا تعطّل بقية المعالجات
