@@ -150,3 +150,43 @@ async def make_image(provider: str, prompt: str):
         except AIError as e:
             last = e
     raise last or AIError("لا يوجد مزوّد صور مُفعّل")
+
+
+# ============================ الفحص (/aitest) ============================
+async def diagnose() -> str:
+    """يفحص مفاتيح Gemini و Grok والموديلات ويرجع تقريراً نصياً"""
+    lines = ["🤖 فحص مفاتيح النماذج\n"]
+
+    if not GEMINI_API_KEY:
+        lines.append("❌ Gemini: GEMINI_API_KEY غير مضبوط")
+    else:
+        try:
+            async with httpx.AsyncClient(timeout=15) as c:
+                r = await c.get("https://generativelanguage.googleapis.com/v1beta/models",
+                                headers={"x-goog-api-key": GEMINI_API_KEY})
+            if r.status_code == 200:
+                models = [m.get("name", "").split("/")[-1] for m in r.json().get("models", [])]
+                lines.append(f"✅ Gemini: المفتاح سليم ({len(models)} موديل متاح)")
+            else:
+                e = _err(r, "Gemini", "models")
+                lines.append(f"❌ Gemini: {e}")
+        except httpx.HTTPError as e:
+            lines.append(f"❌ Gemini: تعذر الاتصال ({type(e).__name__})")
+
+    for label, model in (("Grok", GROK_MODEL), ("Grok الاحتياطي", GROK_FALLBACK_MODEL)):
+        if not GROK_API_KEY:
+            lines.append(f"❌ {label}: GROK_API_KEY غير مضبوط")
+            continue
+        try:
+            async with httpx.AsyncClient(timeout=20) as c:
+                r = await c.post("https://api.x.ai/v1/chat/completions",
+                                 json={"model": model, "max_tokens": 1,
+                                       "messages": [{"role": "user", "content": "ping"}]},
+                                 headers={"Authorization": f"Bearer {GROK_API_KEY}"})
+            if r.status_code == 200:
+                lines.append(f"✅ {label} [{model}]")
+            else:
+                lines.append(f"❌ {label} [{model}]: {_err(r, 'Grok', model)}")
+        except httpx.HTTPError as e:
+            lines.append(f"❌ {label} [{model}]: تعذر الاتصال ({type(e).__name__})")
+    return "\n".join(lines)
