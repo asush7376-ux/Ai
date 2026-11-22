@@ -33,7 +33,7 @@ log = logging.getLogger("usernames")
 
 CACHE_FILE = os.environ.get("USERNAMES_CACHE", "usernames_cache.json")
 FREE, FRAG, TAKEN, INVALID, ERROR = "free", "fragment", "taken", "invalid", "error"
-TTL = {TAKEN: 7 * 86400, INVALID: 30 * 86400, FRAG: 12 * 3600}  # مدة تجاهل إعادة الفحص
+TTL = {TAKEN: 7 * 86400, INVALID: 30 * 86400, FRAG: 12 * 3600, FREE: 86400}  # مدة تجاهل إعادة الفحص
 LETTERS = string.ascii_lowercase
 CONS = "bcdfghjklmnprstvwxyz"
 VOWELS = "aeiou"
@@ -144,7 +144,7 @@ def load_cache() -> None:
 
 def save_cache() -> None:
     now = time.time()
-    keep = {n: v for n, v in _cache.items() if v[0] == FREE or now - v[1] < TTL.get(v[0], 0)}
+    keep = {n: v for n, v in _cache.items() if now - v[1] < TTL.get(v[0], 0)}
     try:
         tmp = CACHE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
