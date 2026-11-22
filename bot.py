@@ -490,7 +490,7 @@ async def respond(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int
 
     # وضع المكتبة
     p = prefs(chat_id)
-    if p.get("lib") and not group:
+    if p.get("lib"):
         if lib_available(admin):
             await lib_handle(context, chat_id, admin, text)
             return
@@ -635,7 +635,8 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text
     replied = msg.reply_to_message and msg.reply_to_message.from_user and \
         msg.reply_to_message.from_user.id == bot.id
     known = {"اسال", "صمم", "ابحث", "النموذج", "المود", "المودات", "جديد", "مساعده", "ارسل", "المزيد"}
-    if cmd not in known and not mentioned and not replied:
+    library_selected = prefs(chat.id).get("lib") and lib_available(is_admin(uid))
+    if cmd not in known and not mentioned and not replied and not library_selected:
         return  # رسالة عادية بين الأعضاء: لا يُرد عليها
 
     if status != "ok":
@@ -705,6 +706,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text
             await msg.reply_text("⚠️ لم أجد هذا المود. اكتب: المودات")
         else:
             prefs(chat.id)["mode"] = found
+            prefs(chat.id)["lib"] = False
             save_data()
             HISTORY.pop(chat.id, None)
             await msg.reply_text(f"✅ المود الآن: {DB['modes'][found]['name']}")
