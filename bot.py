@@ -24,6 +24,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import threading
 import time
@@ -365,9 +366,10 @@ async def edit(q, text: str, markup=None) -> None:
 
 # ============================ Gemini ============================
 class GeminiError(Exception):
-    def __init__(self, msg: str, fatal: bool = False):
+    def __init__(self, msg: str, fatal: bool = False, status: int | None = None):
         super().__init__(msg)
         self.fatal = fatal
+        self.status = status  # كود HTTP من Gemini إن وُجد (None = فشل اتصال)
 
 
 async def call_gemini(model: str, system_prompt: str, contents: list,
@@ -403,6 +405,7 @@ async def call_gemini(model: str, system_prompt: str, contents: list,
         raise GeminiError(
             f"خطأ Gemini ({r.status_code}) [{model}]: {hints.get(r.status_code, '')}\n{msg[:300]}",
             fatal=r.status_code in (400, 401, 403),
+            status=r.status_code,
         )
 
     data = r.json()
@@ -417,26 +420,75 @@ async def call_gemini(model: str, system_prompt: str, contents: list,
     return text
 
 
-async def ask_gemini(system_prompt: str, contents: list, smart: bool = False, json_mode: bool = False):
-    """يرجع (النص، الموديل الذي ردّ فعلاً)"""
-    if smart:
-        plan = [(SMART_MODEL, 45.0), (GEMINI_MODEL, 30.0)]
-    else:
-        plan = [(GEMINI_MODEL, 30.0), (GEMINI_MODEL, 30.0)]
-    if FALLBACK_MODEL and FALLBACK_MODEL not in [m for m, _ in plan]:
-        plan.append((FALLBACK_MODEL, 30.0))
+GEMINI_RETRY_BUDGET = 40.0  # أقصى زمن كلي (ثوانٍ) للمحاولات قبل الاستسلام
+GEMINI_BACKOFF = (2.0, 5.0)  # انتظار قبل المحاولة الثانية والثالثة عند ضغط 503
 
+
+async def ask_gemini(system_prompt: str, contents: list, smart: bool = False, json_mode: bool = False):
+    """يرجع (النص، الموديل الذي ردّ فعلاً)
+
+    - 503: إعادة محاولة بانتظار، بنفس سقف المحاولات القديم، وتجربة موديل مختلف إن وُجد.
+    - 500/502/504/مهلة/اتصال: محاولة واحدة على موديل مختلف فقط إن وُجد، بلا تكرار على نفس الموديل.
+    - 429 (حصة): لا نعيد على نفس الموديل، ننتقل لموديل آخر مختلف فقط إن وُجد.
+    - 400/401/403: فشل فوري (إلا الموديل الذكي نكمل للسريع).
+    - الزمن الكلي محدود بـ GEMINI_RETRY_BUDGET.
+    """
+    models = [SMART_MODEL, GEMINI_MODEL] if smart else [GEMINI_MODEL]
+    if FALLBACK_MODEL:
+        models.append(FALLBACK_MODEL)
+    models = list(dict.fromkeys(models))  # بدون تكرار مع حفظ الترتيب
+
+    # سقف المحاولات = نفس السقف القديم (محاولتان، وثالثة فقط إن كان الاحتياطي موديلاً مختلفاً)
+    max_attempts = 2 + (1 if FALLBACK_MODEL and FALLBACK_MODEL not in ([SMART_MODEL, GEMINI_MODEL] if smart else [GEMINI_MODEL]) else 0)
+
+    t0 = time.monotonic()
     last: GeminiError | None = None
-    for i, (model, timeout) in enumerate(plan):
+    mi = 0       # فهرس الموديل الحالي
+    attempts = 0
+    while attempts < max_attempts:
+        model = models[mi % len(models)]
+        timeout = 45.0 if (smart and model == SMART_MODEL) else 30.0
+        remaining = GEMINI_RETRY_BUDGET - (time.monotonic() - t0)
+        if remaining < 5.0:
+            break  # لا وقت كافٍ لمحاولة أخرى
+        timeout = min(timeout, remaining)
+        attempts += 1
         try:
-            return await call_gemini(model, system_prompt, contents, timeout, json_mode), model
+            try:
+                # سقف زمني صارم لكل محاولة (httpx يحدد المهلة لكل مرحلة وليس للطلب كاملاً)
+                return await asyncio.wait_for(
+                    call_gemini(model, system_prompt, contents, timeout, json_mode), timeout + 1), model
+            except asyncio.TimeoutError:
+                raise GeminiError(f"انتهت مهلة Gemini [{model}]")
         except GeminiError as e:
+            last = e
+            log.warning("المحاولة %d فشلت: %s", attempts, e)
             if e.fatal and model != SMART_MODEL:
                 raise
-            last = e
-            log.warning("المحاولة %d فشلت: %s", i + 1, e)
-            if i < len(plan) - 1:
-                await asyncio.sleep(1.5)
+            if e.status == 429:
+                # حصة: لا فائدة من الإعادة على نفس الموديل
+                if mi + 1 >= len(models):
+                    raise
+                mi += 1
+                continue
+            if e.fatal:
+                mi += 1  # الموديل الذكي غير متاح لهذا المفتاح، جرّب التالي
+                if mi >= len(models):
+                    raise
+                continue
+            if e.status != 503:
+                # 500/502/504/مهلة/انقطاع: قد يكون الطلب اكتمل عند Google، فلا نكرره على نفس الموديل
+                if mi + 1 >= len(models):
+                    raise
+                mi += 1
+                continue
+            # 503 (ضغط مؤقت، لا يُحتسب): انتظر ثم جرّب الموديل التالي (أو نفسه إن كان وحيداً)
+            if len(models) > 1:
+                mi += 1
+            wait = GEMINI_BACKOFF[min(attempts - 1, len(GEMINI_BACKOFF) - 1)] + random.uniform(0, 1)
+            if attempts >= max_attempts or time.monotonic() - t0 + wait >= GEMINI_RETRY_BUDGET - 5.0:
+                break
+            await asyncio.sleep(wait)
     raise last
 
 
